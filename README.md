@@ -10,6 +10,7 @@
 - **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, SOCKS5, HTTP/HTTPS
 - **Automatic health checking** with configurable failure thresholds and blacklist duration, plus manual blacklist/release from the dashboard
 - **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
+- **Sticky sessions**: optional dedicated port that pins each client (by source IP) to a fixed upstream node for a stable egress IP, coexisting with the rotating pool entry
 - **Multiple node sources**: inline config, `nodes.txt` file, or subscription URLs (Base64, plain text, Clash YAML)
 - **Subscription auto-refresh with hot-reload**: periodically fetches subscription updates and reloads without restart
 - **WebUI dashboard**: real-time node status, traffic charts, diagnostics, log console, and full settings management
@@ -107,6 +108,16 @@ dns:
   strategy: prefer_ipv4
 
 nodes_file: nodes.txt
+```
+
+### Sticky Proxy (optional, pool/hybrid mode)
+
+When enabled, a dedicated extra port is opened (default `listener.port + 1`, i.e. `2324`) that coexists with the regular `2323` entry. Clients connecting through the sticky port are pinned to a single upstream node by **source IP**, keeping the egress IP stable instead of rotating on every connection. The pin is permanent until the pinned node is blacklisted/removed. Listen address and credentials are inherited from `listener`.
+
+```yaml
+sticky:
+  enabled: true
+  port: 2324    # defaults to listener.port + 1 when omitted
 ```
 
 ### Full Config Reference

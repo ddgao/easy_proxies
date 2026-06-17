@@ -48,6 +48,9 @@ type Options struct {
 	// Multi-member pools pick a different member per retry; single-member pools retry the same member.
 	RetryAttempts int
 	Metadata      map[string]MemberMeta
+	// Sticky pins each client (by source IP) to a single member, only
+	// re-selecting when the pinned member becomes unavailable. Pool/hybrid entry only.
+	Sticky bool
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -87,6 +90,9 @@ type poolOutbound struct {
 	rngMu          sync.Mutex // protects rng for random mode
 	monitor        *monitor.Manager
 	candidatesPool sync.Pool
+	sticky         bool
+	stickyMu       sync.Mutex        // protects stickyMap
+	stickyMap      map[string]string // sticky key (client source IP) -> member tag
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -109,11 +115,15 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 		mode:    normalized.Mode,
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		monitor: monitorMgr,
+		sticky:  normalized.Sticky,
 		candidatesPool: sync.Pool{
 			New: func() any {
 				return make([]*memberState, 0, memberCount)
 			},
 		},
+	}
+	if p.sticky {
+		p.stickyMap = make(map[string]string)
 	}
 
 	// Register nodes immediately if monitor is available
@@ -350,6 +360,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	maxAttempts := p.maxAttempts()
+	stickyKey := p.stickyKeyFromCtx(ctx)
 	singleMember := len(p.options.Members) <= 1
 	var tried map[string]bool
 	if !singleMember && maxAttempts > 1 {
@@ -357,7 +368,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		member, err := p.pickMemberFiltered(network, tried)
+		member, err := p.pickMemberFiltered(network, tried, stickyKey)
 		if err != nil {
 			if lastErr != nil {
 				return nil, fmt.Errorf("%w (after %d attempt(s); last: %v)", err, attempt-1, lastErr)
@@ -396,6 +407,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	maxAttempts := p.maxAttempts()
+	stickyKey := p.stickyKeyFromCtx(ctx)
 	singleMember := len(p.options.Members) <= 1
 	var tried map[string]bool
 	if !singleMember && maxAttempts > 1 {
@@ -403,7 +415,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		member, err := p.pickMemberFiltered(N.NetworkUDP, tried)
+		member, err := p.pickMemberFiltered(N.NetworkUDP, tried, stickyKey)
 		if err != nil {
 			if lastErr != nil {
 				return nil, fmt.Errorf("%w (after %d attempt(s); last: %v)", err, attempt-1, lastErr)
@@ -454,7 +466,7 @@ func (p *poolOutbound) maxAttempts() int {
 // pickMemberFiltered selects a healthy member, optionally excluding tags in `tried`.
 // When `tried` is nil or every healthy member has been tried, falls back to picking
 // any healthy member (ensuring single-member pools retry the same node).
-func (p *poolOutbound) pickMemberFiltered(network string, tried map[string]bool) (*memberState, error) {
+func (p *poolOutbound) pickMemberFiltered(network string, tried map[string]bool, stickyKey string) (*memberState, error) {
 	now := time.Now()
 	candidates := p.getCandidateBuffer()
 
@@ -497,7 +509,7 @@ func (p *poolOutbound) pickMemberFiltered(network string, tried map[string]bool)
 		}
 	}
 
-	member := p.selectMember(candidates)
+	member := p.selectMember(candidates, stickyKey)
 	p.putCandidateBuffer(candidates)
 	return member, nil
 }
@@ -530,7 +542,7 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 		return nil, E.New("no healthy proxy available")
 	}
 
-	member := p.selectMember(candidates)
+	member := p.selectMember(candidates, "")
 	p.putCandidateBuffer(candidates)
 	return member, nil
 }
@@ -575,7 +587,54 @@ func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
 	return true
 }
 
-func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
+const stickyFallbackKey = "_global_"
+
+// stickyKeyFromCtx returns the sticky key (client source IP) for this request,
+// or "" when stickiness is disabled. Falls back to a shared global key when the
+// source address cannot be determined, so such requests still pin together.
+func (p *poolOutbound) stickyKeyFromCtx(ctx context.Context) string {
+	if !p.sticky {
+		return ""
+	}
+	if md := adapter.ContextFrom(ctx); md != nil && md.Source.IsValid() {
+		return md.Source.AddrString()
+	}
+	return stickyFallbackKey
+}
+
+// selectMember picks a member, honouring stickiness when stickyKey is non-empty.
+func (p *poolOutbound) selectMember(candidates []*memberState, stickyKey string) *memberState {
+	if stickyKey != "" {
+		return p.selectSticky(candidates, stickyKey)
+	}
+	return p.selectByMode(candidates)
+}
+
+// selectSticky returns the member pinned to stickyKey if it is still among the
+// candidates; otherwise it selects a fresh member (by mode) and pins it. The
+// pin is permanent until the member drops out of the candidate set
+// (blacklisted/removed), at which point a new member is chosen and pinned.
+func (p *poolOutbound) selectSticky(candidates []*memberState, stickyKey string) *memberState {
+	p.stickyMu.Lock()
+	defer p.stickyMu.Unlock()
+	if tag, ok := p.stickyMap[stickyKey]; ok {
+		for _, member := range candidates {
+			if member.tag == tag {
+				return member
+			}
+		}
+		// Pinned member is no longer available: drop the stale pin and re-select.
+		delete(p.stickyMap, stickyKey)
+	}
+	member := p.selectByMode(candidates)
+	if member != nil {
+		p.stickyMap[stickyKey] = member.tag
+	}
+	return member
+}
+
+// selectByMode applies the configured scheduling strategy.
+func (p *poolOutbound) selectByMode(candidates []*memberState) *memberState {
 	switch p.mode {
 	case modeRandom:
 		p.rngMu.Lock()

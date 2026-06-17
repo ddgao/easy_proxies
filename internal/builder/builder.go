@@ -243,6 +243,47 @@ func Build(cfg *config.Config) (option.Options, error) {
 			Options: &poolOptions,
 		})
 		route.Final = poolout.Tag
+
+		// Build dedicated sticky entry: same node pool, but clients are pinned
+		// to a single node by source IP. Coexists with the non-sticky entry.
+		if cfg.Sticky.Enabled {
+			const stickyInboundTag = "sticky-in"
+			stickyOutboundTag := poolout.Tag + "-sticky"
+			stickyInbound, err := buildStickyInbound(cfg)
+			if err != nil {
+				return option.Options{}, err
+			}
+			inbounds = append(inbounds, stickyInbound)
+			stickyOptions := poolout.Options{
+				Mode:              cfg.Pool.Mode,
+				Members:           memberTags,
+				FailureThreshold:  cfg.Pool.FailureThreshold,
+				BlacklistDuration: cfg.Pool.BlacklistDuration,
+				RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
+				RetryAttempts:     cfg.Pool.RetryAttempts,
+				Metadata:          metadata,
+				Sticky:            true,
+			}
+			outbounds = append(outbounds, option.Outbound{
+				Type:    poolout.Type,
+				Tag:     stickyOutboundTag,
+				Options: &stickyOptions,
+			})
+			route.Rules = append(route.Rules, option.Rule{
+				Type: C.RuleTypeDefault,
+				DefaultOptions: option.DefaultRule{
+					RawDefaultRule: option.RawDefaultRule{
+						Inbound: badoption.Listable[string]{stickyInboundTag},
+					},
+					RuleAction: option.RuleAction{
+						Action: C.RuleActionTypeRoute,
+						RouteOptions: option.RouteActionOptions{
+							Outbound: stickyOutboundTag,
+						},
+					},
+				},
+			})
+		}
 	}
 
 	// Build multi-port inbounds (one port per node)
@@ -388,6 +429,33 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 		Options: inboundOptions,
 	}
 	return inbound, nil
+}
+
+// buildStickyInbound builds the dedicated sticky-session entry inbound.
+// It mirrors the pool inbound but listens on the configured sticky port and
+// reuses the listener's address and credentials.
+func buildStickyInbound(cfg *config.Config) (option.Inbound, error) {
+	listenAddr, err := parseAddr(cfg.Listener.Address)
+	if err != nil {
+		return option.Inbound{}, fmt.Errorf("parse listener address: %w", err)
+	}
+	inboundOptions := &option.HTTPMixedInboundOptions{
+		ListenOptions: option.ListenOptions{
+			Listen:     listenAddr,
+			ListenPort: cfg.Sticky.Port,
+		},
+	}
+	if cfg.Listener.Username != "" {
+		inboundOptions.Users = []auth.User{{
+			Username: cfg.Listener.Username,
+			Password: cfg.Listener.Password,
+		}}
+	}
+	return option.Inbound{
+		Type:    C.TypeMixed,
+		Tag:     "sticky-in",
+		Options: inboundOptions,
+	}, nil
 }
 
 func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound, error) {
@@ -1365,6 +1433,14 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		log.Printf("   Nodes in pool (%d):", len(metadata))
 		for _, meta := range metadata {
 			log.Printf("   • %s", meta.Name)
+		}
+		if cfg.Sticky.Enabled {
+			log.Println("")
+			stickyHTTP := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Sticky.Port)
+			stickySOCKS := fmt.Sprintf("socks5://%s%s:%d", auth, cfg.Listener.Address, cfg.Sticky.Port)
+			log.Printf("📌 Sticky Entry Point (pinned by client IP):")
+			log.Printf("   HTTP:   %s", stickyHTTP)
+			log.Printf("   SOCKS5: %s", stickySOCKS)
 		}
 		if showMultiPort {
 			log.Println("")

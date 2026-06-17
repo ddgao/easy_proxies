@@ -15,6 +15,7 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
   - `nodes_file`（每行一个 URI）
   - `subscriptions`（支持 Base64/纯文本/Clash YAML 解析）
 - 自动健康检查、失败熔断和黑名单恢复。
+- 粘性代理：可选的独立端口，按来源 IP 把客户端固定绑定到同一上游节点，保持出口 IP 稳定，与轮询的 pool 入口共存（仅 pool/hybrid 模式）。
 - Web 管理面板 + API：
   - 节点状态/探测/导出
   - **手动拉黑/解封节点**
@@ -81,6 +82,16 @@ dns:
   strategy: prefer_ipv4
 
 nodes_file: nodes.txt
+```
+
+## 粘性代理（可选，仅 Pool/Hybrid 模式）
+
+开启后会额外监听一个独立端口（默认 `listener.port + 1`，即 `2324`），与原 `2323` 端口共存。通过粘性端口接入的客户端会按**来源 IP** 固定绑定到同一个上游节点，保持出口 IP 稳定（避免轮询导致 IP 频繁跳变触发风控/掉登录态）。绑定为永久保持，仅当该节点被拉黑/移除时才重新选择。监听地址与认证复用 `listener` 配置。
+
+```yaml
+sticky:
+  enabled: true
+  port: 2324    # 留空或 0 则默认为 listener.port + 1
 ```
 
 ## DNS 配置说明

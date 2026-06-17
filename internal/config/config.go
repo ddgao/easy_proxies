@@ -25,6 +25,7 @@ type Config struct {
 	Listener            ListenerConfig            `yaml:"listener"`
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
+	Sticky              StickyConfig              `yaml:"sticky"`
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
@@ -65,6 +66,15 @@ type ListenerConfig struct {
 	Port     uint16 `yaml:"port"`
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+}
+
+// StickyConfig configures an optional dedicated sticky-session entry port.
+// When enabled (pool/hybrid mode only), clients connecting to this port are
+// pinned to a single upstream node by source IP, keeping the egress IP stable.
+// The sticky port reuses the listener's address and credentials.
+type StickyConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Port    uint16 `yaml:"port"`
 }
 
 // PoolConfig configures scheduling + failure handling.
@@ -412,6 +422,10 @@ func (c *Config) normalize() error {
 		}
 	}
 
+	if err := c.normalizeSticky(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -563,6 +577,39 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 
 	c.normalizeLogConfig()
 
+	if err := c.normalizeSticky(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// normalizeSticky applies defaults and validation for the optional sticky entry port.
+// Sticky sessions only apply to the shared pool entry, so they are disabled
+// outside pool/hybrid mode. Must run after node ports are assigned.
+func (c *Config) normalizeSticky() error {
+	if !c.Sticky.Enabled {
+		return nil
+	}
+	if c.Mode != "pool" && c.Mode != "hybrid" {
+		log.Printf("⚠️  sticky.enabled is set but mode is %q; sticky only applies to pool/hybrid mode, disabling", c.Mode)
+		c.Sticky.Enabled = false
+		return nil
+	}
+	if c.Sticky.Port == 0 {
+		if c.Listener.Port >= 65535 {
+			return fmt.Errorf("cannot auto-assign sticky.port (listener.port is %d); set sticky.port explicitly", c.Listener.Port)
+		}
+		c.Sticky.Port = c.Listener.Port + 1
+	}
+	if c.Sticky.Port == c.Listener.Port {
+		return fmt.Errorf("sticky.port %d conflicts with listener.port", c.Sticky.Port)
+	}
+	for idx := range c.Nodes {
+		if c.Nodes[idx].Port == c.Sticky.Port {
+			return fmt.Errorf("sticky.port %d conflicts with node %q port", c.Sticky.Port, c.Nodes[idx].Name)
+		}
+	}
 	return nil
 }
 

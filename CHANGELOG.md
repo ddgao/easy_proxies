@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-06-17
+
 ### Added
+- **Sticky Proxy**: Optional dedicated entry port (default `listener.port + 1`, e.g. `2324`) that pins each client to a single upstream node by source IP, keeping the egress IP stable instead of rotating per connection
+  - Coexists with the regular non-sticky pool entry (`2323`) — choose per port
+  - Pin is permanent until the node is blacklisted/removed, then re-selects automatically
+  - New `sticky` config section (`enabled`, `port`); listen address and credentials inherited from `listener`
+  - Pool/hybrid mode only
 - **Log Rotation**: Configurable log file rotation with size limits, backup count, and compression
   - New `log` section in config with `output`, `file`, `max_size`, `max_backups`, `max_age`, `compress` options
   - Uses lumberjack for automatic log rotation
