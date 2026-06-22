@@ -15,6 +15,8 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
   - `nodes_file`（每行一个 URI）
   - `subscriptions`（支持 Base64/纯文本/Clash YAML 解析）
 - 自动健康检查、失败熔断和黑名单恢复。
+- 拨号失败自动重试：节点拨号失败时自动切换到另一个健康节点重试（可配置次数）。
+- 端口稳定（multi-port/hybrid）：每个节点按 URI 稳定标识（忽略名称与参数顺序），订阅刷新或重启后保持同一本地端口（持久化到 config.yaml 同目录的 `node_ports.json`）。
 - 粘性代理：可选的独立端口，按来源 IP 把客户端固定绑定到同一上游节点，保持出口 IP 稳定，与轮询的 pool 入口共存（仅 pool/hybrid 模式）。
 - Web 管理面板 + API：
   - 节点状态/探测/导出
@@ -69,6 +71,8 @@ pool:
   mode: sequential    # sequential / random / balance / latency
   failure_threshold: 3
   blacklist_duration: 24h
+  retry_enabled: true # 拨号失败时切换到另一节点重试
+  retry_attempts: 3   # 每个请求的最大拨号次数
 
 management:
   enabled: true
@@ -136,6 +140,7 @@ dns:
   - 订阅更新时会保留内联节点，不会覆盖
   - 节点顺序：内联节点在前，订阅节点在后
   - 各节点的来源标识（inline/subscription）会在管理界面中显示
+- **端口稳定**（multi-port/hybrid）：节点按 URI 稳定标识（忽略名称与参数顺序），订阅改名或重排都保持同一本地端口；分配结果保存到 config.yaml 同目录的 `node_ports.json`，重启后自动恢复。删除该文件可强制重新分配。
 
 ## 协议支持注意事项
 
@@ -148,7 +153,7 @@ dns:
   - 支持 SIP002：`ss://base64(method:password)@server:port#name`
   - 支持旧格式：`ss://base64(method:password@server:port)#name`
 - `hysteria2` / `hy2`
-- `socks5` / `socks`
+- `socks5` / `socks5h` / `socks`
 - `http` / `https`
 - `anytls`
 - `tuic`

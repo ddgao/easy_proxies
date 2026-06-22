@@ -9,10 +9,12 @@
 - **Three runtime modes**: `pool` (single-port load balancing), `multi-port` (one port per node), and `hybrid` (both simultaneously)
 - **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, SOCKS5, HTTP/HTTPS
 - **Automatic health checking** with configurable failure thresholds and blacklist duration, plus manual blacklist/release from the dashboard
+- **Automatic fail-over retry**: when a node's dial fails, the request is retried on another healthy node (configurable attempts)
 - **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
 - **Sticky sessions**: optional dedicated port that pins each client (by source IP) to a fixed upstream node for a stable egress IP, coexisting with the rotating pool entry
 - **Multiple node sources**: inline config, `nodes.txt` file, or subscription URLs (Base64, plain text, Clash YAML)
 - **Subscription auto-refresh with hot-reload**: periodically fetches subscription updates and reloads without restart
+- **Stable per-node ports**: in `multi-port`/`hybrid` mode each node keeps the same local port across subscription refreshes and restarts (persisted to `node_ports.json`)
 - **WebUI dashboard**: real-time node status, traffic charts, diagnostics, log console, and full settings management
 - **Management API**: RESTful endpoints for node CRUD, probing, blacklisting, subscription management, and config reload
 - **Configurable DNS resolver** with fallback servers and IPv4/IPv6 strategy control
@@ -79,6 +81,7 @@ Open `http://localhost:9091` in your browser.
 | `sequential` | Round-robin through healthy nodes |
 | `random` | Random node selection |
 | `balance` | Least-connections balancing |
+| `latency` | Pick the node with the lowest measured latency |
 
 ### Minimal Config Example
 
@@ -95,6 +98,8 @@ pool:
   mode: sequential    # sequential / random / balance / latency
   failure_threshold: 3
   blacklist_duration: 24h
+  retry_enabled: true # retry on another node when a dial fails
+  retry_attempts: 3   # max total dial attempts per request
 
 management:
   enabled: true
@@ -268,7 +273,7 @@ resp, err := client.Get("http://example.com")
 | Hysteria2 | `hysteria2://`, `hy2://` | QUIC-based |
 | TUIC | `tuic://` | QUIC-based |
 | AnyTLS | `anytls://` | TLS |
-| SOCKS5 | `socks5://`, `socks://` | Direct |
+| SOCKS5 | `socks5://`, `socks5h://`, `socks://` | Direct |
 | HTTP | `http://`, `https://` | Direct |
 
 ## Node Sources
@@ -307,6 +312,8 @@ Supports Base64, plain text, and Clash YAML formats. When subscriptions are conf
 - Subscription updates preserve inline nodes instead of overwriting them
 - Node order: inline nodes first, followed by subscription nodes
 - Each node's source (inline/subscription) is tracked and displayed in the management UI
+
+**Stable Ports** (`multi-port`/`hybrid`): each node is identified by a stable key derived from its URI (ignoring the display name and parameter order), so a node keeps the same local port even when the subscription renames or reorders it. Assignments are saved to `node_ports.json` next to `config.yaml` and restored on restart.
 
 ## WebUI Dashboard
 
@@ -372,8 +379,11 @@ services:
 |------|-------|
 | 2323 | Pool proxy entry (pool/hybrid mode) |
 | 9091 | WebUI and Management API |
+| 9092 | Internal Clash API (localhost only, traffic stats) |
 | 1221 | GeoIP region router (when enabled, configurable) |
 | 24000+ | Multi-port mode (one per node) |
+
+In `multi-port`/`hybrid` mode, per-node ports are persisted to `node_ports.json` (next to `config.yaml`) and restored on restart, so each node keeps a stable port across restarts and subscription refreshes. Delete this file to force a clean reassignment.
 
 ## Troubleshooting
 

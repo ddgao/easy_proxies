@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Stable per-node ports**: in `multi-port`/`hybrid` mode, each node keeps the same local port across subscription refreshes and process restarts
+  - Ports are preserved by a stable node identity derived from the URI (ignoring the display name and query-parameter order), so renamed or reordered subscription nodes keep their port
+  - Assignments are persisted to `node_ports.json` next to `config.yaml` and restored on startup
+- **Shadowsocks-compatible link format**: support for additional Shadowsocks URI variants (#28)
+
+### Changed
+- Improved configuration persistence diagnostics and error handling
+
+### Fixed
+- WebUI: long node names and URIs are now truncated so they no longer break the table layout
+- Prevent crash from malformed VLESS `packetEncoding` nodes
+- Preserve inline nodes when a subscription update occurs
+
+## [3.0.1] - 2026-06-17
+
+### Added
+- WebUI: sticky proxy settings are now editable from the dashboard
+
 ## [3.0.0] - 2026-06-17
 
 ### Added
