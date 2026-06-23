@@ -25,13 +25,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	monitorCfg := monitor.Config{
-		Enabled:       cfg.ManagementEnabled(),
-		Listen:        cfg.Management.Listen,
-		ProbeTarget:   cfg.Management.ProbeTarget,
-		Password:      cfg.Management.Password,
-		ProxyUsername: proxyUsername,
-		ProxyPassword: proxyPassword,
-		ExternalIP:    cfg.ExternalIP,
+		Enabled:          cfg.ManagementEnabled(),
+		Listen:           cfg.Management.Listen,
+		ProbeTarget:      cfg.Management.ProbeTarget,
+		Password:         cfg.Management.Password,
+		ProxyUsername:    proxyUsername,
+		ProxyPassword:    proxyPassword,
+		ExternalIP:       cfg.ExternalIP,
+		ProbeConcurrency: cfg.ProbeConcurrencyOrDefault(),
 	}
 
 	// Create and start BoxManager

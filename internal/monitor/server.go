@@ -13,7 +13,6 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -82,9 +81,6 @@ type Server struct {
 	sessions   map[string]*Session
 	sessionTTL time.Duration
 
-	// Concurrency control
-	probeSem *semaphore.Weighted
-
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
 }
@@ -98,19 +94,12 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		logger = log.Default()
 	}
 
-	// Calculate max concurrent probes
-	maxConcurrentProbes := int64(runtime.NumCPU() * 4)
-	if maxConcurrentProbes < 10 {
-		maxConcurrentProbes = 10
-	}
-
 	s := &Server{
 		cfg:        cfg,
 		mgr:        mgr,
 		logger:     logger,
 		sessions:   make(map[string]*Session),
 		sessionTTL: 24 * time.Hour,
-		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
 	}
 
 	// Start session cleanup goroutine
@@ -172,6 +161,11 @@ func (s *Server) SetConfig(cfg *config.Config) {
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
+		// Sync probe concurrency to the manager so periodic health checks pick
+		// up WebUI changes after a reload (batch probes read it per request).
+		if s.mgr != nil {
+			s.mgr.SetProbeConcurrency(cfg.ProbeConcurrencyOrDefault())
+		}
 		// Sync proxy credentials based on mode
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
 			s.cfg.ProxyUsername = cfg.MultiPort.Username
@@ -192,6 +186,18 @@ func (s *Server) getSettings() (externalIP, probeTarget string, skipCertVerify b
 		logCfg = s.cfgSrc.Log
 	}
 	return s.cfg.ExternalIP, s.cfg.ProbeTarget, s.cfg.SkipCertVerify, logCfg
+}
+
+// currentProbeConcurrency returns the probe concurrency from the live config,
+// clamped to a safe range. Read per batch-probe request so WebUI changes apply
+// after a reload without restarting the process.
+func (s *Server) currentProbeConcurrency() int64 {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	if s.cfgSrc != nil {
+		return int64(s.cfgSrc.ProbeConcurrencyOrDefault())
+	}
+	return 32
 }
 
 // updateSettings updates dynamic settings and persists to config file.
@@ -452,8 +458,26 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "data: %s\n\n", startData)
 	flusher.Flush()
 
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	// Read concurrency from the live config so WebUI changes take effect after
+	// a reload (no process restart required). A fresh semaphore is created per
+	// request to avoid mutating a shared one while probes are in flight.
+	concurrency := s.currentProbeConcurrency()
+	sem := semaphore.NewWeighted(concurrency)
+
+	// Create context with a timeout scaled to node count and concurrency so that
+	// large inventories (e.g. thousands of nodes) are not cut off by a fixed
+	// 2-minute deadline. Each probe still has its own 10s deadline; here we only
+	// bound the total wall time as ceil(total / concurrency) * perProbe + slack.
+	perProbe := 10 * time.Second
+	batches := (int64(total) + concurrency - 1) / concurrency
+	totalTimeout := time.Duration(batches)*perProbe + 30*time.Second
+	if totalTimeout < 2*time.Minute {
+		totalTimeout = 2 * time.Minute
+	}
+	if totalTimeout > 30*time.Minute {
+		totalTimeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), totalTimeout)
 	defer cancel()
 
 	// Probe all nodes with semaphore control
@@ -473,7 +497,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 
 			// Acquire semaphore permit
-			if err := s.probeSem.Acquire(ctx, 1); err != nil {
+			if err := sem.Acquire(ctx, 1); err != nil {
 				results <- probeResult{
 					tag:  snap.Tag,
 					name: snap.Name,
@@ -481,7 +505,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			defer s.probeSem.Release(1)
+			defer sem.Release(1)
 
 			// Execute probe
 			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -861,8 +885,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"port":    cfg.Sticky.Port,
 			}
 			resp["management"] = map[string]any{
-				"listen":   cfg.Management.Listen,
-				"password": cfg.Management.Password,
+				"listen":            cfg.Management.Listen,
+				"password":          cfg.Management.Password,
+				"probe_concurrency": cfg.ProbeConcurrencyOrDefault(),
 			}
 			resp["geoip"] = map[string]any{
 				"enabled":              cfg.GeoIP.Enabled,
@@ -902,8 +927,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				Port    uint16 `json:"port"`
 			} `json:"sticky,omitempty"`
 			Management *struct {
-				Listen   string `json:"listen"`
-				Password string `json:"password"`
+				Listen           string `json:"listen"`
+				Password         string `json:"password"`
+				ProbeConcurrency int    `json:"probe_concurrency"`
 			} `json:"management,omitempty"`
 			Log *struct {
 				Output     string `json:"output"`
@@ -981,6 +1007,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			if req.Management != nil {
 				s.cfgSrc.Management.Listen = req.Management.Listen
 				s.cfgSrc.Management.Password = req.Management.Password
+				if req.Management.ProbeConcurrency > 0 {
+					s.cfgSrc.Management.ProbeConcurrency = req.Management.ProbeConcurrency
+				}
 			}
 			if req.GeoIP != nil {
 				s.cfgSrc.GeoIP.DatabasePath = req.GeoIP.DatabasePath

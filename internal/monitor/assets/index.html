@@ -558,6 +558,7 @@
               </tbody>
             </table>
             <div id="emptyState" style="display:none; text-align:center; padding: 40px; color: var(--text-muted);">暂无数据</div>
+            <div id="nodesPagingHint" style="display:none; text-align:center; padding: 12px; color: var(--text-muted); font-size: 12px;"></div>
           </div>
         </div>
       </div>
@@ -736,10 +737,12 @@
 
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">管理面板 (Management)</div></div>
-              <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+              <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
                 <div class="form-group"><label>监听地址</label><input type="text" id="settingMgmtListen" class="setting-input" placeholder="0.0.0.0:8080" /></div>
                 <div class="form-group"><label>访问密码</label><input type="password" id="settingMgmtPassword" class="setting-input" /></div>
+                <div class="form-group"><label>探测并发数</label><input type="number" id="settingProbeConcurrency" class="setting-input" min="1" max="200" placeholder="32" /></div>
               </div>
+              <div style="font-size: 11px; color: var(--text-muted); padding: 0 16px 12px;">探测并发数：批量探测与周期健康检查的并发线程数（10-200，默认 32），修改后需重载核心生效</div>
             </div>
 
             <div class="panel" style="margin-bottom: 16px;">
@@ -893,6 +896,7 @@
     let autoRefreshInterval = null;
     let allNodesCache = [];
     let currentRegionFilter = 'all';
+    let nodeRenderLimit = 300;
     let isEditMode = false;
     let configNodes = [];
     let _savedSubSnapshot = '';
@@ -1003,8 +1007,8 @@
     }
 
     function escapeHtml(text) {
-      if(!text) return '';
-      const div = document.createElement('div'); div.textContent = text; return div.innerHTML;
+      if(text == null) return '';
+      return String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
     async function refresh() {
@@ -1181,9 +1185,12 @@
 
     function renderNodes(nodes) {
       const tbody = document.getElementById('nodesTableBody');
-      if (!nodes.length) { tbody.innerHTML = ''; document.getElementById('emptyState').style.display='block'; return;}
+      const hint = document.getElementById('nodesPagingHint');
+      if (!nodes.length) { tbody.innerHTML = ''; document.getElementById('emptyState').style.display='block'; if(hint) hint.style.display='none'; return;}
       document.getElementById('emptyState').style.display='none';
-      tbody.innerHTML = nodes.map(n => {
+      // 分批渲染：节点量大时只渲染前 nodeRenderLimit 个，避免一次性插入数千行 DOM 导致卡顿。
+      const visible = nodes.slice(0, nodeRenderLimit);
+      tbody.innerHTML = visible.map(n => {
         const ms = n.last_latency_ms || -1;
         let badge = '', statusText = '';
         if (n.blacklisted) { badge = 'badge-error'; statusText = '拉黑 Blocked'; }
@@ -1213,6 +1220,20 @@
           </td>
         </tr>`;
       }).join('');
+      if (hint) {
+        if (nodes.length > visible.length) {
+          const more = Math.min(300, nodes.length - visible.length);
+          hint.style.display = 'block';
+          hint.innerHTML = `显示 ${visible.length} / ${nodes.length} 个节点 <button class="btn btn-sm" style="margin-left:10px" onclick="showMoreNodes()">显示更多 (+${more})</button>`;
+        } else {
+          hint.style.display = 'none';
+        }
+      }
+    }
+
+    function showMoreNodes() {
+      nodeRenderLimit += 300;
+      filterByRegion(currentRegionFilter);
     }
 
     async function probeNode(tag) {
@@ -1494,6 +1515,7 @@
         const mgmt = d.management || {};
         document.getElementById('settingMgmtListen').value = mgmt.listen || '';
         document.getElementById('settingMgmtPassword').value = mgmt.password || '';
+        document.getElementById('settingProbeConcurrency').value = mgmt.probe_concurrency || 32;
         // GeoIP
         const geo = d.geoip || {};
         document.getElementById('settingGeoIPEnabled').checked = geo.enabled || false;
@@ -1547,6 +1569,7 @@
         sticky_port: document.getElementById('settingStickyPort').value,
         mgmt_listen: document.getElementById('settingMgmtListen').value,
         mgmt_password: document.getElementById('settingMgmtPassword').value,
+        mgmt_probe_concurrency: document.getElementById('settingProbeConcurrency').value,
         geoip_enabled: document.getElementById('settingGeoIPEnabled').checked,
         geoip_db: document.getElementById('settingGeoIPDBPath').value,
         geoip_listen: document.getElementById('settingGeoIPListen').value,
@@ -1616,6 +1639,7 @@
           management: {
             listen: document.getElementById('settingMgmtListen').value,
             password: document.getElementById('settingMgmtPassword').value,
+            probe_concurrency: parseInt(document.getElementById('settingProbeConcurrency').value) || 32,
           },
           log: {
             output: document.getElementById('settingLogOutput').value,

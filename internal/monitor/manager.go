@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,14 +17,15 @@ import (
 
 // Config mirrors user settings needed by the monitoring server.
 type Config struct {
-	Enabled        bool
-	Listen         string
-	ProbeTarget    string
-	Password       string
-	ProxyUsername  string // 代理池的用户名（用于导出）
-	ProxyPassword  string // 代理池的密码（用于导出）
-	ExternalIP     string // 外部 IP 地址，用于导出时替换 0.0.0.0
-	SkipCertVerify bool   // 全局跳过 SSL 证书验证
+	Enabled          bool
+	Listen           string
+	ProbeTarget      string
+	Password         string
+	ProxyUsername    string // 代理池的用户名（用于导出）
+	ProxyPassword    string // 代理池的密码（用于导出）
+	ExternalIP       string // 外部 IP 地址，用于导出时替换 0.0.0.0
+	SkipCertVerify   bool   // 全局跳过 SSL 证书验证
+	ProbeConcurrency int    // 并发探测线程数（批量探测与周期健康检查共用）
 }
 
 // NodeInfo is static metadata about a proxy entry.
@@ -97,14 +97,15 @@ type entry struct {
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
-	cfg        Config
-	probeDst   M.Socksaddr
-	probeReady bool
-	mu         sync.RWMutex
-	nodes      map[string]*entry
-	ctx        context.Context
-	cancel     context.CancelFunc
-	logger     Logger
+	cfg               Config
+	probeDst          M.Socksaddr
+	probeReady        bool
+	probeConcurrency  int
+	mu                sync.RWMutex
+	nodes             map[string]*entry
+	ctx               context.Context
+	cancel            context.CancelFunc
+	logger            Logger
 }
 
 // Logger interface for logging
@@ -117,10 +118,11 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:    cfg,
-		nodes:  make(map[string]*entry),
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:              cfg,
+		nodes:            make(map[string]*entry),
+		ctx:              ctx,
+		cancel:           cancel,
+		probeConcurrency: cfg.ProbeConcurrency,
 	}
 	if cfg.ProbeTarget != "" {
 		target := cfg.ProbeTarget
@@ -155,6 +157,17 @@ func NewManager(cfg Config) (*Manager, error) {
 // SetLogger sets the logger for the manager.
 func (m *Manager) SetLogger(logger Logger) {
 	m.logger = logger
+}
+
+// SetProbeConcurrency updates the worker limit used by periodic health checks.
+// Called when the live config changes so WebUI edits apply after a reload.
+func (m *Manager) SetProbeConcurrency(n int) {
+	if n < 8 {
+		n = 8
+	}
+	m.mu.Lock()
+	m.probeConcurrency = n
+	m.mu.Unlock()
 }
 
 // StartPeriodicHealthCheck starts a background goroutine that periodically checks all nodes.
@@ -212,7 +225,9 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
 
-	workerLimit := runtime.NumCPU() * 2
+	m.mu.RLock()
+	workerLimit := m.probeConcurrency
+	m.mu.RUnlock()
 	if workerLimit < 8 {
 		workerLimit = 8
 	}
@@ -367,6 +382,10 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 }
 
 // Probe triggers a manual health check.
+// It updates the full availability state (available / initialCheckDone / lastOK /
+// lastError) so that manual and batch probes are reflected in the dashboard and
+// SnapshotFiltered results immediately, matching the behaviour of the periodic
+// probeAllNodes loop.
 func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) {
 	e, err := m.entry(tag)
 	if err != nil {
@@ -376,10 +395,21 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		return 0, errors.New("probe not available for this node")
 	}
 	latency, err := e.probe(ctx)
+	e.mu.Lock()
+	e.initialCheckDone = true
+	if err != nil {
+		e.lastError = err.Error()
+		e.lastFail = time.Now()
+		e.available = false
+	} else {
+		e.lastOK = time.Now()
+		e.lastProbe = latency
+		e.available = true
+	}
+	e.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
-	e.recordProbeLatency(latency)
 	return latency, nil
 }
 
@@ -539,12 +569,6 @@ func (e *entry) setRelease(fn releaseFunc) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.release = fn
-}
-
-func (e *entry) recordProbeLatency(d time.Duration) {
-	e.mu.Lock()
-	e.lastProbe = d
-	e.mu.Unlock()
 }
 
 // RecordFailure updates failure counters.
