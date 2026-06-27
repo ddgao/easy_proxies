@@ -37,6 +37,42 @@ const (
 	modeLatency    = "latency"
 )
 
+// Startup-probe concurrency is bounded process-wide, not per pool. In hybrid /
+// multi-port mode the builder creates ONE single-member pool per node, and each
+// pool launches its own startup probe. The per-pool worker limit is therefore
+// useless (a single-member pool runs exactly one probe), so with thousands of
+// nodes thousands of probe dials would fire simultaneously, exhausting file
+// descriptors and stalling the whole process. This shared semaphore caps the
+// TOTAL number of in-flight startup probes across every pool instance.
+var (
+	startupProbeSemOnce sync.Once
+	startupProbeSem     chan struct{}
+	startupProbeLimit   int32 = 64 // default; override via SetStartupProbeLimit before boxes start
+)
+
+// SetStartupProbeLimit sets the process-wide cap on concurrent startup probes.
+// Call it once before any box starts (e.g. from app setup) with the configured
+// probe concurrency. It is a no-op after the semaphore has been initialized.
+func SetStartupProbeLimit(n int) {
+	if n < 8 {
+		n = 8
+	}
+	if n > 256 {
+		n = 256
+	}
+	atomic.StoreInt32(&startupProbeLimit, int32(n))
+}
+
+// acquireStartupProbeSlot blocks until a global startup-probe slot is free and
+// returns a release func. Lazily initializes the semaphore on first use.
+func acquireStartupProbeSlot() func() {
+	startupProbeSemOnce.Do(func() {
+		startupProbeSem = make(chan struct{}, int(atomic.LoadInt32(&startupProbeLimit)))
+	})
+	startupProbeSem <- struct{}{}
+	return func() { <-startupProbeSem }
+}
+
 // Options controls pool outbound behaviour.
 type Options struct {
 	Mode              string
@@ -291,8 +327,15 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	copy(members, p.members)
 	p.mu.Unlock()
 
-	// Concurrent probing with bounded workers
-	const maxWorkers = 20
+	// Concurrent probing with bounded workers. Honor the configured probe
+	// concurrency so startup matches the periodic/batch probe behavior instead
+	// of a fixed width; fall back to a safe default when unavailable.
+	maxWorkers := 20
+	if p.monitor != nil {
+		if n := p.monitor.ProbeConcurrency(); n > 0 {
+			maxWorkers = n
+		}
+	}
 	type probeResult struct {
 		member  *memberState
 		success bool
@@ -307,6 +350,11 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		sem <- struct{}{} // acquire worker slot
 		go func(m *memberState) {
 			defer func() { <-sem }() // release worker slot
+
+			// Bound total concurrent startup probes across ALL pools, otherwise
+			// thousands of single-member pools would dial simultaneously.
+			releaseGlobal := acquireStartupProbeSlot()
+			defer releaseGlobal()
 
 			ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
 			defer cancel()
