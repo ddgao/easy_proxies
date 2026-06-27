@@ -737,15 +737,12 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		return config.NodeConfig{}, err
 	}
 
-	// Determine source: if subscriptions exist, new nodes go to nodes.txt (subscription source)
-	// Otherwise, if nodes_file exists, use file source; else inline
-	if len(m.cfg.Subscriptions) > 0 {
-		normalized.Source = config.NodeSourceSubscription
-	} else if m.cfg.NodesFile != "" {
-		normalized.Source = config.NodeSourceFile
-	} else {
-		normalized.Source = config.NodeSourceInline
-	}
+	// A node added through the WebUI is an explicit user configuration, so it is
+	// always persisted as an inline node in config.yaml — regardless of whether
+	// subscriptions are configured. Classifying it as a subscription/file source
+	// would route it to nodes.txt, which the next subscription refresh overwrites
+	// (createNewConfig preserves only inline nodes), silently losing the node.
+	normalized.Source = config.NodeSourceInline
 
 	m.cfg.Nodes = append(m.cfg.Nodes, normalized)
 	if err := m.cfg.Save(); err != nil {
