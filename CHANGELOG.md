@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Error messages now match actual mount configuration**: entrypoint.sh error messages previously hardcoded `./data/` paths, causing confusion when using file-mount mode (`-v ./nodes.txt:/etc/easy_proxies/nodes.txt`). Now displays correct fix instructions for both directory-mount and file-mount configurations
 
 ### Fixed
+- **Batch probe hangs forever (WebUI frozen at "N/M")**: some sing-box outbound connection types don't honor `SetReadDeadline`/`SetWriteDeadline`, so probing a node that accepts TCP but never sends an HTTP response blocked on `Read`/the TLS handshake forever. Those stuck goroutines eventually occupied every semaphore slot, so `wg.Wait` never returned and the progress froze (e.g. stuck around 1600/8363). Probes now use a context watchdog that force-closes the connection when the 10s per-probe deadline fires, guaranteeing every probe returns
 - **WebUI: dashboard blacklist/abnormal count stuck at 0**: `GET /api/nodes` returned only the filtered healthy set, so the frontend never saw blacklisted/unavailable nodes and their count always showed 0. It now returns the full node set, restoring the count and making blacklisted nodes visible in the table with a working "解封" (release) button
 - WebUI: long node names and URIs are now truncated so they no longer break the table layout
 - Prevent crash from malformed VLESS `packetEncoding` nodes

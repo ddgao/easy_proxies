@@ -695,6 +695,65 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	return ttfb, nil
 }
 
+// probeMember dials the probe destination through a member and measures latency.
+// A context watchdog force-closes the underlying connection when ctx is cancelled
+// or its deadline fires. This is essential: some sing-box outbound connection
+// types do not honor SetDeadline, so without the watchdog a probe against a node
+// that accepts TCP but never sends an HTTP response would block on Read / the TLS
+// handshake forever, leaking goroutines and hanging the whole batch probe
+// (wg.Wait would never return, freezing the WebUI at "N/M").
+func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, destination M.Socksaddr, host string, useTLS bool) (time.Duration, error) {
+	start := time.Now()
+	rawConn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+	if err != nil {
+		if member.entry != nil {
+			member.entry.RecordFailure(err)
+		}
+		return 0, err
+	}
+	// Watchdog: close the raw connection as soon as ctx is done so any blocked
+	// Read/Write/handshake below is unblocked even when SetDeadline is a no-op.
+	probeDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawConn.Close()
+		case <-probeDone:
+		}
+	}()
+	defer close(probeDone)
+	defer rawConn.Close()
+
+	conn := rawConn
+	// Strict mode: upgrade to TLS and verify the certificate chain so that
+	// nodes whose exit hijacks TLS (self-signed certs) fail the probe.
+	if conn, err = upgradeProbeConn(ctx, conn, host, useTLS); err != nil {
+		if member.entry != nil {
+			member.entry.RecordFailure(err)
+		}
+		return 0, err
+	}
+
+	// Perform HTTP probe to measure actual latency (TTFB).
+	if _, err = httpProbe(conn, destination.AddrString()); err != nil {
+		if member.entry != nil {
+			member.entry.RecordFailure(err)
+		}
+		return 0, err
+	}
+
+	duration := time.Since(start)
+	if member.entry != nil {
+		member.entry.RecordSuccessWithLatency(duration)
+	}
+	// Clear pool blacklist on successful probe — a node that passes health check
+	// should be available for selection immediately (fixes #8, #9).
+	if member.shared != nil {
+		member.shared.forceRelease()
+	}
+	return duration, nil
+}
+
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
@@ -704,46 +763,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		return nil
 	}
 	return func(ctx context.Context) (time.Duration, error) {
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Strict mode: upgrade to TLS and verify the certificate chain so that
-		// nodes whose exit hijacks TLS (self-signed certs) fail the probe.
-		if conn, err = upgradeProbeConn(ctx, conn, host, useTLS); err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Total duration = dial time + HTTP probe
-		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
-		// Clear pool blacklist on successful probe — a node that passes
-		// health check should be available for selection immediately,
-		// not remain blacklisted for the full duration (fixes #8, #9).
-		if member.shared != nil {
-			member.shared.forceRelease()
-		}
-		return duration, nil
+		return p.probeMember(ctx, member, destination, host, useTLS)
 	}
 }
 
@@ -779,45 +799,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		if member == nil {
 			return 0, E.New("member not found: ", tag)
 		}
-
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Strict mode: upgrade to TLS and verify the certificate chain so that
-		// nodes whose exit hijacks TLS (self-signed certs) fail the probe.
-		if conn, err = upgradeProbeConn(ctx, conn, host, useTLS); err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Total duration = dial time + TTFB
-		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
-		// Clear pool blacklist on successful probe (fixes #8, #9)
-		if member.shared != nil {
-			member.shared.forceRelease()
-		}
-		return duration, nil
+		return p.probeMember(ctx, member, destination, host, useTLS)
 	}
 }
 
