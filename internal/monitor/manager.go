@@ -312,8 +312,36 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			defer func() { <-sem }()
 
 			ctx, cancel := context.WithTimeout(m.ctx, timeout)
-			latency, err := probe(ctx)
-			cancel()
+			defer cancel()
+
+			// Race the probe against its deadline. Some sing-box protocol dials
+			// block inside DialContext without honoring ctx, so a direct
+			// probe(ctx) call could never return — wedging this worker's
+			// semaphore slot and hanging the whole sweep (wg.Wait never returns;
+			// the dashboard shows a stuck init and 0 available even though the
+			// nodes are reachable). Run the probe in its own goroutine and select
+			// on ctx.Done() so the worker always returns within timeout. The
+			// buffered channel lets the stalled goroutine deliver its result
+			// later (its connection watchdog force-closes on ctx.Done) without
+			// blocking on send.
+			type probeOutcome struct {
+				latency time.Duration
+				err     error
+			}
+			resCh := make(chan probeOutcome, 1)
+			go func() {
+				latency, err := probe(ctx)
+				resCh <- probeOutcome{latency: latency, err: err}
+			}()
+
+			var latency time.Duration
+			var err error
+			select {
+			case out := <-resCh:
+				latency, err = out.latency, out.err
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
 
 			entry.mu.Lock()
 			uri := entry.info.URI
