@@ -461,7 +461,34 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	if e.probe == nil {
 		return 0, errors.New("probe not available for this node")
 	}
-	latency, err := e.probe(ctx)
+
+	// Enforce the context deadline at this level. Some sing-box outbound
+	// protocols block inside DialContext without honoring ctx cancellation, so a
+	// probe could otherwise never return — which in batch mode occupies a
+	// semaphore slot forever and freezes the whole run (wg.Wait never returns,
+	// WebUI stuck at "N/M"). Run the probe in its own goroutine and race it
+	// against ctx: if ctx fires first we return a timeout error and let the
+	// stuck goroutine unwind on its own (its conn watchdog force-closes on
+	// ctx.Done). The result channel is buffered so that late goroutine never
+	// blocks on send.
+	type probeOutcome struct {
+		latency time.Duration
+		err     error
+	}
+	resCh := make(chan probeOutcome, 1)
+	go func() {
+		latency, err := e.probe(ctx)
+		resCh <- probeOutcome{latency: latency, err: err}
+	}()
+
+	var latency time.Duration
+	select {
+	case out := <-resCh:
+		latency, err = out.latency, out.err
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+
 	e.mu.Lock()
 	e.initialCheckDone = true
 	if err != nil {
