@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Assignments are persisted to `node_ports.json` next to `config.yaml` and restored on startup
 - **Shadowsocks-compatible link format**: support for additional Shadowsocks URI variants (#28)
 - **WebUI: export all nodes**: new "全部导出" button and `GET /api/export?all=true` that exports every node regardless of health (dead or alive); the default export still returns only healthy/available nodes
+- **WebUI: initial health-check progress**: the startup/periodic node sweep now publishes live progress (`done/total`, available, failed) through `GET /api/nodes` and drives the shared progress bar, so the dashboard shows "初始化探测中 N/M" instead of appearing frozen until the sweep finishes
 
 ### Changed
+- **Transient failures (429 rate-limit, timeouts, connection resets) no longer trigger the 24h blacklist**: such errors are common for shared/free nodes briefly rate-limited by their CDN and usually clear on their own. They now impose only a short 60s cooldown and do not count toward the 3-strikes permanent-blacklist threshold; permanent faults (handshake/cert/protocol failures, 404, etc.) keep the original 3 → 24h behavior. This stops a burst of concurrent requests from mass-blacklisting otherwise-healthy nodes for a full day
 - Improved configuration persistence diagnostics and error handling
 - `entrypoint.sh` now detects the "bind-mount of a non-existent file → Docker creates a directory" foot-gun for `config.yaml`/`nodes.txt` and exits with an actionable fix instead of a vague runtime crash
 - Removed `start.sh` and `diagnose.sh` helper scripts; `docker compose up -d` (with a directory mount) is now the documented path. README/docs updated to inline the equivalent checks

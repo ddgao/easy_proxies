@@ -320,11 +320,19 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	sweepActive, sweepDone, sweepTotal, sweepOK, sweepFail := s.mgr.ProbeSweepProgress()
 	payload := map[string]any{
 		"nodes":          allNodes,
 		"total_nodes":    totalNodes,
 		"region_stats":   regionStats,
 		"region_healthy": regionHealthy,
+		"probe_sweep": map[string]any{
+			"active":    sweepActive,
+			"done":      sweepDone,
+			"total":     sweepTotal,
+			"available": sweepOK,
+			"failed":    sweepFail,
+		},
 	}
 	writeJSON(w, payload)
 }

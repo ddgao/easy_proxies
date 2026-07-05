@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,37 @@ type sharedMemberState struct {
 	blacklistedUntil time.Time
 	entry            atomic.Pointer[monitor.EntryHandle]
 	active           atomic.Int32
+}
+
+// transientCooldown is how long a node is skipped after a transient failure
+// (rate-limit / timeout / connection reset). Far shorter than the 24h blacklist
+// used for permanent faults, because these errors usually clear on their own —
+// e.g. a shared free node briefly rate-limited (HTTP 429) by its CDN.
+const transientCooldown = 60 * time.Second
+
+// isTransientError reports whether err looks like a temporary condition that
+// should NOT count toward the permanent-blacklist threshold. Rate limiting
+// (429), timeouts and connection resets fall here: the node is likely alive and
+// will recover, so a full 24h ban would needlessly drain the healthy pool.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "429"),
+		strings.Contains(msg, "too many requests"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "reset by peer"),
+		strings.Contains(msg, "temporarily"),
+		strings.Contains(msg, "try again"),
+		strings.Contains(msg, "service unavailable"),
+		strings.Contains(msg, "503"):
+		return true
+	}
+	return false
 }
 
 var sharedStateStore sync.Map // map[tag]*sharedMemberState
@@ -60,30 +92,48 @@ func (s *sharedMemberState) entryHandle() *monitor.EntryHandle {
 	return s.entry.Load()
 }
 
-// recordFailure increments failure count and triggers blacklist if threshold reached.
-// Returns: (current failures, blacklisted, blacklist until time)
-func (s *sharedMemberState) recordFailure(cause error, threshold int, duration time.Duration) (int, bool, time.Time) {
+// recordFailure records a failure and decides whether to blacklist the node.
+//
+// Transient errors (rate-limit 429, timeouts, connection resets) do NOT count
+// toward the permanent threshold; instead they impose a short cooldown so the
+// node is briefly skipped and then retried automatically. Permanent errors
+// (handshake/cert/protocol failures, 404, etc.) accumulate toward the threshold
+// and trigger the full blacklist duration once it is reached.
+//
+// Returns: (current permanent-failure count, blacklisted, blacklist-until, transient).
+func (s *sharedMemberState) recordFailure(cause error, threshold int, duration time.Duration) (int, bool, time.Time, bool) {
+	transient := isTransientError(cause)
+
 	s.mu.Lock()
-	s.failures++
-	count := s.failures
+	var count int
 	triggered := false
 	var until time.Time
-	if s.failures >= threshold {
-		triggered = true
-		until = time.Now().Add(duration)
-		s.failures = 0
+	if transient {
+		// Short cooldown only; do not accumulate toward the 24h blacklist.
+		count = s.failures
+		until = time.Now().Add(transientCooldown)
 		s.blacklisted = true
 		s.blacklistedUntil = until
+	} else {
+		s.failures++
+		count = s.failures
+		if s.failures >= threshold {
+			triggered = true
+			until = time.Now().Add(duration)
+			s.failures = 0
+			s.blacklisted = true
+			s.blacklistedUntil = until
+		}
 	}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
 		entry.RecordFailure(cause)
-		if triggered {
+		if triggered || transient {
 			entry.Blacklist(until)
 		}
 	}
-	return count, triggered, until
+	return count, triggered, until, transient
 }
 
 func (s *sharedMemberState) recordSuccess() {

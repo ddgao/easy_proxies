@@ -108,6 +108,24 @@ type Manager struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	logger           Logger
+
+	// Sweep progress for the WebUI. probeSweepActive is 1 while probeAllNodes
+	// runs; the counters let the dashboard show a live "初始化探测中 3200/8363".
+	probeSweepActive atomic.Int32
+	probeSweepTotal  atomic.Int32
+	probeSweepDone   atomic.Int32
+	probeSweepOK     atomic.Int32
+	probeSweepFail   atomic.Int32
+}
+
+// ProbeSweepProgress reports the current health-check sweep progress. active is
+// true only while a sweep is running.
+func (m *Manager) ProbeSweepProgress() (active bool, done, total, ok, failed int) {
+	return m.probeSweepActive.Load() == 1,
+		int(m.probeSweepDone.Load()),
+		int(m.probeSweepTotal.Load()),
+		int(m.probeSweepOK.Load()),
+		int(m.probeSweepFail.Load())
 }
 
 // Logger interface for logging
@@ -275,6 +293,15 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
 
+	// Publish sweep progress for the WebUI. Reset counters, mark active, and
+	// clear the active flag when the sweep returns.
+	m.probeSweepTotal.Store(int32(len(entries)))
+	m.probeSweepDone.Store(0)
+	m.probeSweepOK.Store(0)
+	m.probeSweepFail.Store(0)
+	m.probeSweepActive.Store(1)
+	defer m.probeSweepActive.Store(0)
+
 	m.mu.RLock()
 	workerLimit := m.probeConcurrency
 	m.mu.RUnlock()
@@ -302,6 +329,8 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			e.initialCheckDone = true
 			e.available = true
 			e.mu.Unlock()
+			m.probeSweepOK.Add(1)
+			m.probeSweepDone.Add(1)
 			continue
 		}
 
@@ -347,18 +376,21 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			uri := entry.info.URI
 			if err != nil {
 				failedCount.Add(1)
+				m.probeSweepFail.Add(1)
 				entry.lastError = err.Error()
 				entry.lastFail = time.Now()
 				entry.available = false
 				entry.initialCheckDone = true
 			} else {
 				availableCount.Add(1)
+				m.probeSweepOK.Add(1)
 				entry.lastOK = time.Now()
 				entry.lastProbe = latency
 				entry.available = true
 				entry.initialCheckDone = true
 			}
 			entry.mu.Unlock()
+			m.probeSweepDone.Add(1)
 
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed: ", FormatProbeFailure(tag, uri, err))

@@ -896,6 +896,7 @@
     let isAutoRefresh = true;
     let autoRefreshInterval = null;
     let allNodesCache = [];
+    let sweepWasActive = false;
     let currentRegionFilter = 'all';
     let nodeRenderLimit = 300;
     let isEditMode = false;
@@ -1043,8 +1044,31 @@
         updateDashboardStats(data);
         filterByRegion(currentRegionFilter);
         document.getElementById('lastUpdate').textContent = `Sync: ${new Date().toLocaleTimeString()}`;
+        updateSweepProgress(data.probe_sweep);
         fetchSubscriptionStatus();
       } catch(e) {}
+    }
+
+    // updateSweepProgress reflects the backend initial/periodic health-check
+    // sweep on the shared progress bar. It defers to an in-flight manual batch
+    // probe (isProbing) so the two never fight over the same widget.
+    function updateSweepProgress(sweep) {
+      if (isProbing) return;
+      const wrap = document.getElementById('probeProgress');
+      if (sweep && sweep.active && sweep.total > 0) {
+        document.getElementById('probeStats').textContent = `${sweep.done}/${sweep.total}`;
+        document.getElementById('probeSuccess').textContent = sweep.available;
+        document.getElementById('probeFail').textContent = sweep.failed;
+        const pct = sweep.total > 0 ? (sweep.done / sweep.total * 100) : 0;
+        document.getElementById('probeProgressFill').style.width = `${pct}%`;
+        wrap.classList.add('show');
+        sweepWasActive = true;
+      } else if (sweepWasActive) {
+        // Sweep just finished — briefly show 100% then hide.
+        document.getElementById('probeProgressFill').style.width = '100%';
+        sweepWasActive = false;
+        setTimeout(() => { if (!isProbing) wrap.classList.remove('show'); }, 1500);
+      }
     }
 
     function updateDashboardStats(data) {
