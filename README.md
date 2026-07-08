@@ -301,6 +301,8 @@ subscriptions:
 subscription_refresh:
   enabled: true
   interval: 1h
+  timeout: 30s
+  fetch_concurrency: 16
 ```
 
 Supports Base64, plain text, and Clash YAML formats. When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes trigger automatic hot-reload without restart.

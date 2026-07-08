@@ -125,6 +125,7 @@ geoip:
 #   enabled: false              # 是否启用定时刷新
 #   interval: 1h                # 刷新间隔（默认 1 小时）
 #   timeout: 30s                # 获取订阅的超时时间
+#   fetch_concurrency: 16       # 订阅抓取并发数（默认 16，最大 32）
 #   health_check_timeout: 60s   # 新节点健康检查超时
 #   drain_timeout: 30s          # 旧实例排空超时时间
 #   min_available_nodes: 1      # 最少可用节点数，低于此值不切换

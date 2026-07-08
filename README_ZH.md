@@ -134,6 +134,7 @@ dns:
   - 会抓取订阅节点并追加到运行节点列表
   - `nodes_file` 作为订阅节点写入路径
   - 启动阶段不再从 `nodes_file` 读取节点
+  - 可通过 `subscription_refresh.fetch_concurrency` 调整订阅抓取并发数（默认 16，最大 32）
 - `nodes`（内联节点）只要存在就会参与运行。
 - **多来源节点合并**：当同时配置 `nodes` 和 `subscriptions` 时：
   - 内联节点（config.yaml 中的 `nodes`）和订阅节点会合并使用

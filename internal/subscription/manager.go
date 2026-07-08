@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -490,66 +489,35 @@ func (m *Manager) MarkNodesModified() {
 
 // fetchAllSubscriptions fetches nodes from all configured subscription URLs.
 func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
-	var allNodes []config.NodeConfig
-	var lastErr error
-
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-
-	for _, subURL := range m.baseCfg.Subscriptions {
-		nodes, err := m.fetchSubscription(subURL, timeout)
-		if err != nil {
-			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
-			lastErr = err
-			continue
+	nodes, stats := config.FetchSubscriptionNodes(m.ctx, m.baseCfg.Subscriptions, config.SubscriptionFetchOptions{
+		Timeout:     timeout,
+		Concurrency: m.baseCfg.SubscriptionRefresh.FetchConcurrency,
+		Client:      m.httpClient,
+		Loggerf: func(format string, args ...any) {
+			m.logger.Infof(format, args...)
+		},
+	})
+	if stats.DedupedURLs > 0 || stats.DedupedNodes > 0 {
+		m.logger.Infof("subscription dedupe summary: urls=%d, nodes=%d", stats.DedupedURLs, stats.DedupedNodes)
+	}
+	if cachedNodes, err := config.LoadNodesFromFile(m.getNodesFilePath()); err == nil && len(cachedNodes) > 0 {
+		if len(nodes) == 0 {
+			m.logger.Warnf("using %d cached subscription nodes because refresh returned no usable nodes", len(cachedNodes))
+			return cachedNodes, nil
 		}
-		m.logger.Infof("fetched %d nodes from subscription", len(nodes))
-		allNodes = append(allNodes, nodes...)
+		if stats.Failed > 0 && len(nodes) < len(cachedNodes) {
+			m.logger.Warnf("keeping %d cached subscription nodes because partial refresh only returned %d nodes", len(cachedNodes), len(nodes))
+			return cachedNodes, nil
+		}
 	}
-
-	if len(allNodes) == 0 && lastErr != nil {
-		return nil, lastErr
+	if len(nodes) == 0 && stats.LastError != nil {
+		return nil, stats.LastError
 	}
-
-	return allNodes, nil
-}
-
-// fetchSubscription fetches and parses a single subscription URL.
-func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
-	ctx, cancel := context.WithTimeout(m.ctx, timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", "clash-verge/v2.2.3")
-	req.Header.Set("Accept", "*/*")
-
-	// Use custom HTTP client with connection pooling
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	// Limit read size to prevent memory exhaustion
-	const maxBodySize = 10 * 1024 * 1024 // 10MB
-	limitedReader := io.LimitReader(resp.Body, maxBodySize)
-
-	body, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-
-	return config.ParseSubscriptionContent(string(body))
+	return nodes, nil
 }
 
 // createNewConfig creates a new config with updated nodes while preserving other settings.

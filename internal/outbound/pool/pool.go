@@ -129,7 +129,10 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 
 	// Register nodes immediately if monitor is available
 	if monitorMgr != nil {
-		logger.Info("registering ", len(normalized.Members), " nodes to monitor")
+		if memberCount > 1 {
+			logger.Info("registering ", memberCount, " nodes to monitor")
+		}
+		registeredCount := 0
 		for _, memberTag := range normalized.Members {
 			// Acquire shared state for this tag (creates if not exists)
 			state := acquireSharedState(memberTag)
@@ -149,7 +152,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 			if entry != nil {
 				// Attach entry to shared state so all pool instances share it
 				state.attachEntry(entry)
-				logger.Info("registered node: ", memberTag)
+				registeredCount++
 				// Set probe, release, and blacklist functions immediately
 				entry.SetRelease(p.makeReleaseByTagFunc(memberTag))
 				entry.SetBlacklistFn(p.makeBlacklistByTagFunc(memberTag))
@@ -159,6 +162,9 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 			} else {
 				logger.Warn("failed to register node: ", memberTag)
 			}
+		}
+		if memberCount > 1 {
+			logger.Info("registered ", registeredCount, " nodes to monitor")
 		}
 	} else {
 		logger.Warn("monitor manager is nil, skipping node registration")

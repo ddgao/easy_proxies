@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -125,6 +127,7 @@ type SubscriptionRefreshConfig struct {
 	HealthCheckTimeout time.Duration `yaml:"health_check_timeout"` // 新节点健康检查超时
 	DrainTimeout       time.Duration `yaml:"drain_timeout"`        // 旧实例排空超时时间
 	MinAvailableNodes  int           `yaml:"min_available_nodes"`  // 最少可用节点数，低于此值不切换
+	FetchConcurrency   int           `yaml:"fetch_concurrency"`    // 订阅抓取并发数，默认 16，最大 32
 }
 
 // NodeSource indicates where a node configuration originated from.
@@ -135,6 +138,33 @@ const (
 	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
 	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
 )
+
+const (
+	defaultSubscriptionFetchConcurrency = 16
+	maxSubscriptionFetchConcurrency     = 32
+	maxSubscriptionBodySize             = 10 * 1024 * 1024
+)
+
+// SubscriptionFetchStats describes a subscription loading attempt.
+type SubscriptionFetchStats struct {
+	RequestedURLs int
+	UniqueURLs    int
+	Successful    int
+	Failed        int
+	Empty         int
+	Nodes         int
+	DedupedURLs   int
+	DedupedNodes  int
+	LastError     error
+}
+
+// SubscriptionFetchOptions controls concurrent subscription loading.
+type SubscriptionFetchOptions struct {
+	Timeout     time.Duration
+	Concurrency int
+	Client      *http.Client
+	Loggerf     func(format string, args ...any)
+}
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
@@ -334,6 +364,7 @@ func (c *Config) normalize() error {
 	if c.SubscriptionRefresh.MinAvailableNodes <= 0 {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
+	c.SubscriptionRefresh.FetchConcurrency = normalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
 
 	// Mark inline nodes with source
 	for idx := range c.Nodes {
@@ -354,28 +385,36 @@ func (c *Config) normalize() error {
 
 	// Load nodes from subscriptions (highest priority - writes to nodes.txt)
 	if len(c.Subscriptions) > 0 {
-		var subNodes []NodeConfig
-		subTimeout := c.SubscriptionRefresh.Timeout
-		for _, subURL := range c.Subscriptions {
-			nodes, err := loadNodesFromSubscription(subURL, subTimeout)
-			if err != nil {
-				log.Printf("⚠️ Failed to load subscription %q: %v (skipping)", subURL, err)
-				continue
-			}
-			log.Printf("✅ Loaded %d nodes from subscription", len(nodes))
-			subNodes = append(subNodes, nodes...)
+		nodesFilePath := c.NodesFile
+		if nodesFilePath == "" {
+			nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+			c.NodesFile = nodesFilePath
 		}
+		cachedNodes, cacheErr := loadNodesFromFile(nodesFilePath)
+
+		subNodes, stats := FetchSubscriptionNodes(context.Background(), c.Subscriptions, SubscriptionFetchOptions{
+			Timeout:     c.SubscriptionRefresh.Timeout,
+			Concurrency: c.SubscriptionRefresh.FetchConcurrency,
+			Loggerf:     log.Printf,
+		})
+		if stats.Failed > 0 {
+			log.Printf("⚠️  Subscription initialization skipped %d/%d unique URLs; last error: %v", stats.Failed, stats.UniqueURLs, stats.LastError)
+		}
+		log.Printf("✅ Subscription initialization fetched %d nodes from %d/%d unique URLs in parallel (deduped_urls=%d, deduped_nodes=%d)",
+			stats.Nodes, stats.Successful, stats.UniqueURLs, stats.DedupedURLs, stats.DedupedNodes)
 		// Mark subscription nodes and write to nodes.txt
 		for idx := range subNodes {
 			subNodes[idx].Source = NodeSourceSubscription
 		}
-		if len(subNodes) > 0 {
-			// Determine nodes.txt path
-			nodesFilePath := c.NodesFile
-			if nodesFilePath == "" {
-				nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-				c.NodesFile = nodesFilePath
+		useCached, reason := shouldUseCachedSubscriptionNodes(subNodes, cachedNodes, cacheErr, stats)
+		if useCached {
+			log.Printf("⚠️  Keeping cached subscription nodes from %s (%d cached vs %d fetched): %s",
+				nodesFilePath, len(cachedNodes), len(subNodes), reason)
+			for idx := range cachedNodes {
+				cachedNodes[idx].Source = NodeSourceSubscription
 			}
+			subNodes = cachedNodes
+		} else if len(subNodes) > 0 {
 			// Write subscription nodes to nodes.txt
 			if err := writeNodesToFile(nodesFilePath, subNodes); err != nil {
 				log.Printf("⚠️ Failed to write nodes to %q: %v", nodesFilePath, err)
@@ -384,14 +423,6 @@ func (c *Config) normalize() error {
 			}
 		}
 		c.Nodes = append(c.Nodes, subNodes...)
-		// Fallback: if all subscriptions failed, try loading cached nodes.txt
-		if len(subNodes) == 0 && c.NodesFile != "" {
-			cachedNodes, err := loadNodesFromFile(c.NodesFile)
-			if err == nil && len(cachedNodes) > 0 {
-				log.Printf("⚠️  All subscriptions failed, using %d cached nodes from %s", len(cachedNodes), c.NodesFile)
-				c.Nodes = append(c.Nodes, cachedNodes...)
-			}
-		}
 	}
 
 	if len(c.Nodes) == 0 {
@@ -665,6 +696,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.SubscriptionRefresh.MinAvailableNodes <= 0 {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
+	c.SubscriptionRefresh.FetchConcurrency = normalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
 
 	if len(c.Nodes) == 0 {
 		return errors.New("config.nodes cannot be empty")
@@ -677,6 +709,8 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	}
 
 	// First pass: assign ports from portMap for existing nodes
+	preservedPorts := 0
+	duplicatePortHits := 0
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
@@ -702,11 +736,11 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			nodeKey := c.Nodes[idx].NodeKey()
 			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
 				if usedPorts[existingPort] {
-					log.Printf("⚠️  Port %d already assigned to another node with the same identity; node %q will get a fresh port", existingPort, c.Nodes[idx].Name)
+					duplicatePortHits++
 				} else {
 					c.Nodes[idx].Port = existingPort
 					usedPorts[existingPort] = true
-					log.Printf("✅ Preserved port %d for node %q", existingPort, c.Nodes[idx].Name)
+					preservedPorts++
 				}
 			}
 		}
@@ -716,6 +750,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	// is an int (not uint16) so the >65535 exhaustion guard actually fires:
 	// a uint16 cursor would wrap to 0 and silently hand out unbindable low ports.
 	portCursor := int(c.MultiPort.BasePort)
+	newPorts := 0
 	for idx := range c.Nodes {
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
 			// Find next available port that's not used
@@ -727,7 +762,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			}
 			c.Nodes[idx].Port = uint16(portCursor)
 			usedPorts[uint16(portCursor)] = true
-			log.Printf("📌 Assigned new port %d for node %q", portCursor, c.Nodes[idx].Name)
+			newPorts++
 			portCursor++
 		} else if c.Nodes[idx].Port == 0 {
 			c.Nodes[idx].Port = uint16(portCursor)
@@ -741,6 +776,10 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 				c.Nodes[idx].Password = c.MultiPort.Password
 			}
 		}
+	}
+	if c.Mode == "multi-port" || c.Mode == "hybrid" {
+		log.Printf("✅ Port normalization complete: preserved=%d, new=%d, duplicate_identity_conflicts=%d, total_nodes=%d",
+			preservedPorts, newPorts, duplicatePortHits, len(c.Nodes))
 	}
 
 	if c.LogLevel == "" {
@@ -839,17 +878,258 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 	return parseNodesFromContent(string(data))
 }
 
-// loadNodesFromSubscription fetches and parses nodes from a subscription URL
-// Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
-func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
+// LoadNodesFromFile reads a nodes file where each non-comment line is a proxy URI.
+func LoadNodesFromFile(path string) ([]NodeConfig, error) {
+	return loadNodesFromFile(path)
+}
+
+func shouldUseCachedSubscriptionNodes(fetched []NodeConfig, cached []NodeConfig, cacheErr error, stats SubscriptionFetchStats) (bool, string) {
+	if cacheErr != nil || len(cached) == 0 {
+		return false, ""
+	}
+	if len(fetched) == 0 {
+		return true, "all subscriptions failed or returned no usable nodes"
+	}
+	if stats.Failed > 0 && len(fetched) < len(cached) {
+		return true, "partial refresh would reduce the node set"
+	}
+	return false, ""
+}
+
+func normalizeSubscriptionFetchConcurrency(v int) int {
+	if v <= 0 {
+		return defaultSubscriptionFetchConcurrency
+	}
+	if v > maxSubscriptionFetchConcurrency {
+		return maxSubscriptionFetchConcurrency
+	}
+	return v
+}
+
+func newSubscriptionHTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	client := &http.Client{
-		Timeout: timeout,
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   minDuration(timeout, 10*time.Second),
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   minDuration(timeout, 10*time.Second),
+		ResponseHeaderTimeout: minDuration(timeout, 15*time.Second),
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// RedactURL removes credentials and query data from a URL before logging.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	u.User = nil
+	if u.Path != "" && u.Path != "/" {
+		u.Path = "/..."
+		u.RawPath = ""
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "redacted=1"
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+func dedupeSubscriptionURLs(urls []string) (unique []string, deduped int) {
+	seen := make(map[string]struct{}, len(urls))
+	for _, raw := range urls {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if _, ok := seen[raw]; ok {
+			deduped++
+			continue
+		}
+		seen[raw] = struct{}{}
+		unique = append(unique, raw)
+	}
+	return unique, deduped
+}
+
+func dedupeNodesByKey(nodes []NodeConfig) ([]NodeConfig, int) {
+	if len(nodes) < 2 {
+		return nodes, 0
+	}
+	seen := make(map[string]struct{}, len(nodes))
+	out := nodes[:0]
+	deduped := 0
+	for _, node := range nodes {
+		node.URI = strings.TrimSpace(node.URI)
+		if node.URI == "" {
+			deduped++
+			continue
+		}
+		key := node.NodeKey()
+		if key == "" {
+			key = node.URI
+		}
+		if _, ok := seen[key]; ok {
+			deduped++
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, node)
+	}
+	return out, deduped
+}
+
+// FetchSubscriptionNodes fetches subscription URLs concurrently, parses all
+// supported subscription formats, and deduplicates URLs/nodes by stable identity.
+func FetchSubscriptionNodes(ctx context.Context, urls []string, opts SubscriptionFetchOptions) ([]NodeConfig, SubscriptionFetchStats) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	concurrency := normalizeSubscriptionFetchConcurrency(opts.Concurrency)
+	uniqueURLs, dedupedURLs := dedupeSubscriptionURLs(urls)
+	stats := SubscriptionFetchStats{
+		RequestedURLs: len(urls),
+		UniqueURLs:    len(uniqueURLs),
+		DedupedURLs:   dedupedURLs,
+	}
+	if len(uniqueURLs) == 0 {
+		return nil, stats
 	}
 
-	req, err := http.NewRequest("GET", subURL, nil)
+	client := opts.Client
+	if client == nil {
+		client = newSubscriptionHTTPClient(timeout)
+	}
+
+	type result struct {
+		url   string
+		nodes []NodeConfig
+		err   error
+	}
+	jobs := make(chan string)
+	results := make(chan result, len(uniqueURLs))
+
+	workerCount := concurrency
+	if workerCount > len(uniqueURLs) {
+		workerCount = len(uniqueURLs)
+	}
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for subURL := range jobs {
+				nodes, err := fetchSubscriptionWithClient(ctx, client, subURL, timeout)
+				results <- result{url: subURL, nodes: nodes, err: err}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, subURL := range uniqueURLs {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- subURL:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	allNodes := make([]NodeConfig, 0)
+	processed := 0
+	for res := range results {
+		processed++
+		if res.err != nil {
+			stats.Failed++
+			stats.LastError = res.err
+			if opts.Loggerf != nil {
+				opts.Loggerf("⚠️ Failed to load subscription %s: %v (skipping)", RedactURL(res.url), res.err)
+			}
+			continue
+		}
+		if len(res.nodes) == 0 {
+			stats.Empty++
+		} else {
+			stats.Successful++
+		}
+		if opts.Loggerf != nil {
+			opts.Loggerf("✅ Loaded %d nodes from subscription %s", len(res.nodes), RedactURL(res.url))
+		}
+		allNodes = append(allNodes, res.nodes...)
+	}
+	if missing := len(uniqueURLs) - processed; missing > 0 {
+		if err := ctx.Err(); err != nil {
+			stats.Failed += missing
+			stats.LastError = err
+			if opts.Loggerf != nil {
+				opts.Loggerf("⚠️ Subscription fetch context ended before %d subscription URLs were processed: %v", missing, err)
+			}
+		}
+	}
+
+	stats.Nodes = len(allNodes)
+	allNodes, stats.DedupedNodes = dedupeNodesByKey(allNodes)
+	return allNodes, stats
+}
+
+// loadNodesFromSubscription fetches and parses nodes from a subscription URL
+// Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
+func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
+	return fetchSubscriptionWithClient(context.Background(), newSubscriptionHTTPClient(timeout), subURL, timeout)
+}
+
+func fetchSubscriptionWithClient(ctx context.Context, client *http.Client, subURL string, timeout time.Duration) ([]NodeConfig, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	parsed, err := url.Parse(subURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse subscription url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported subscription scheme %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, errors.New("subscription URL is missing host")
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "GET", subURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -862,7 +1142,7 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch subscription: %w", err)
+		return nil, redactSubscriptionError("fetch subscription", subURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -870,15 +1150,31 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		return nil, fmt.Errorf("subscription returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	limitedReader := io.LimitReader(resp.Body, maxSubscriptionBodySize+1)
+	body, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if len(body) > maxSubscriptionBodySize {
+		return nil, fmt.Errorf("subscription response exceeds %d bytes", maxSubscriptionBodySize)
 	}
 
 	content := string(body)
 
 	// Try to detect and parse different formats
 	return parseSubscriptionContent(content)
+}
+
+func redactSubscriptionError(op, rawURL string, err error) error {
+	if err == nil {
+		return nil
+	}
+	redacted := RedactURL(rawURL)
+	message := strings.ReplaceAll(err.Error(), rawURL, redacted)
+	if parsed, parseErr := url.Parse(rawURL); parseErr == nil {
+		message = strings.ReplaceAll(message, parsed.String(), redacted)
+	}
+	return fmt.Errorf("%s: %s", op, message)
 }
 
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)
@@ -1018,6 +1314,7 @@ type clashProxy struct {
 	Port              flexInt                `yaml:"port"`
 	Ports             string                 `yaml:"ports"`
 	UUID              string                 `yaml:"uuid"`
+	Username          string                 `yaml:"username"`
 	Password          string                 `yaml:"password"`
 	Cipher            string                 `yaml:"cipher"`
 	AlterId           int                    `yaml:"alterId"`
@@ -1126,9 +1423,39 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildShadowsocksRURI(p)
 	case "hysteria":
 		return buildHysteriaURI(p)
+	case "http", "https":
+		return buildHTTPProxyURI(p)
 	default:
 		return ""
 	}
+}
+
+func buildHTTPProxyURI(p clashProxy) string {
+	scheme := strings.ToLower(p.Type)
+	if scheme == "http" && p.TLS {
+		scheme = "https"
+	}
+	port := int(p.Port)
+	if port == 0 {
+		if scheme == "https" {
+			port = 443
+		} else {
+			port = 8080
+		}
+	}
+	u := &url.URL{
+		Scheme: scheme,
+		Host:   net.JoinHostPort(p.Server, strconv.Itoa(port)),
+	}
+	if p.Password != "" {
+		u.User = url.UserPassword(p.Username, p.Password)
+	} else if p.Username != "" {
+		u.User = url.User(p.Username)
+	}
+	if p.Name != "" {
+		u.Fragment = p.Name
+	}
+	return u.String()
 }
 
 func buildVMessURI(p clashProxy) string {
