@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/lease"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -59,13 +62,19 @@ type SubscriptionRefresher interface {
 
 // SubscriptionStatus represents subscription refresh status.
 type SubscriptionStatus struct {
-	LastRefresh   time.Time `json:"last_refresh"`
-	NextRefresh   time.Time `json:"next_refresh"`
-	NodeCount     int       `json:"node_count"`
-	LastError     string    `json:"last_error,omitempty"`
-	RefreshCount  int       `json:"refresh_count"`
-	IsRefreshing  bool      `json:"is_refreshing"`
-	NodesModified bool      `json:"nodes_modified"` // True if nodes.txt was modified since last refresh
+	LastRefresh    time.Time `json:"last_refresh"`
+	NextRefresh    time.Time `json:"next_refresh"`
+	NodeCount      int       `json:"node_count"`
+	LastError      string    `json:"last_error,omitempty"`
+	RefreshCount   int       `json:"refresh_count"`
+	IsRefreshing   bool      `json:"is_refreshing"`
+	NodesModified  bool      `json:"nodes_modified"` // True if nodes.txt was modified since last refresh
+	TriggerReason  string    `json:"trigger_reason,omitempty"`
+	BackoffAttempt int       `json:"backoff_attempt"`
+	NextRetry      time.Time `json:"next_retry,omitempty"`
+	Phase          string    `json:"phase,omitempty"`
+	ConfigRevision uint64    `json:"config_revision"`
+	SharedWaiters  int       `json:"shared_waiters"`
 }
 
 // Server exposes HTTP endpoints for monitoring.
@@ -89,6 +98,8 @@ type Server struct {
 
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
+	leaseMu      sync.RWMutex
+	leaseControl lease.Controller
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -112,6 +123,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	go s.cleanupExpiredSessions()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health/live", s.handleLiveness)
+	mux.HandleFunc("/health/ready", s.handleLeaseReadiness)
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
@@ -128,8 +141,67 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 	mux.HandleFunc("/api/traffic", s.withAuth(s.handleTraffic))
 	mux.HandleFunc("/api/logs", s.withAuth(s.handleLogs))
+	mux.HandleFunc("/api/proxy-runtime", s.withAuth(s.handleProxyRuntime))
+	mux.HandleFunc("/api/proxy-events", s.withAuth(s.handleProxyEvents))
+	mux.HandleFunc("/api/proxy-audit", s.withAuth(s.handleProxyAudit))
+	mux.HandleFunc("/api/proxy-leases", s.handleProxyLeases)
+	mux.HandleFunc("/api/proxy-nodes/block", s.withAuth(s.handleProxyNodeBlock))
+	mux.HandleFunc("/api/proxy-nodes/unblock", s.withAuth(s.handleProxyNodeUnblock))
+	mux.HandleFunc("/api/proxy-admin/pause", s.withAuth(s.handleProxyAdminPause))
+	mux.HandleFunc("/api/proxy-admin/resume", s.withAuth(s.handleProxyAdminResume))
+	mux.HandleFunc("/api/proxy-admin/revoke-lease", s.withAuth(s.handleProxyAdminRevokeLease))
+	mux.HandleFunc("/api/proxy-admin/abort-candidate", s.withAuth(s.handleProxyAdminAbortCandidate))
+	mux.HandleFunc("/api/proxy-admin/force-close-generation", s.withAuth(s.handleProxyAdminForceCloseGeneration))
 	s.srv = &http.Server{Addr: cfg.Listen, Handler: mux}
 	return s
+}
+
+func (s *Server) handleLiveness(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"live": true})
+}
+
+func (s *Server) handleLeaseReadiness(w http.ResponseWriter, _ *http.Request) {
+	controller := s.currentLeaseController()
+	if controller == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"ready": false})
+		return
+	}
+	snapshot := controller.Snapshot()
+	if !snapshot.Ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	writeJSON(w, map[string]any{
+		"ready": snapshot.Ready, "ready_node_count": snapshot.ReadyNodeCount,
+		"default_idle_node_count": snapshot.DefaultIdleNodeCount,
+	})
+}
+
+// SetLeaseController 绑定机器调用方使用的租约控制接口。
+// 该接口使用独立 Lease API Token 鉴权，不复用 WebUI Session。
+func (s *Server) SetLeaseController(controller lease.Controller) {
+	if s != nil {
+		s.leaseMu.Lock()
+		defer s.leaseMu.Unlock()
+		s.leaseControl = controller
+	}
+}
+
+func (s *Server) currentLeaseController() lease.Controller {
+	if s == nil {
+		return nil
+	}
+	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+	return s.leaseControl
+}
+
+// Handler 返回管理服务的真实 HTTP 边界，供进程启动和外部接口测试共同使用。
+func (s *Server) Handler() http.Handler {
+	if s == nil || s.srv == nil {
+		return http.NotFoundHandler()
+	}
+	return s.srv.Handler
 }
 
 // SetSubscriptionRefresher sets the subscription refresher for API endpoints.
@@ -615,6 +687,440 @@ func writeJSON(w http.ResponseWriter, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+// handleProxyLeases 为自动化调用方提供租约申请和幂等释放。
+// 机器令牌只授权控制面，实际代理连接仍必须使用每个租约独立的 Lease Token。
+func (s *Server) handleProxyLeases(w http.ResponseWriter, r *http.Request) {
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	authHeader := r.Header.Get("Authorization")
+	apiToken := strings.TrimPrefix(authHeader, "Bearer ")
+	if authHeader == apiToken || !controller.AuthenticateAPIToken(apiToken) {
+		w.WriteHeader(http.StatusUnauthorized)
+		writeJSON(w, map[string]any{"error": "invalid lease API token"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		var request struct {
+			Label       string `json:"label"`
+			ConflictKey string `json:"conflict_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]any{"error": "invalid request body"})
+			return
+		}
+		grant, err := controller.AcquireLease(r.Context(), lease.AcquireRequest{Label: request.Label, ConflictKey: request.ConflictKey})
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			code := "LEASE_UNAVAILABLE"
+			if errors.Is(err, lease.ErrInvalidLabel) {
+				status = http.StatusBadRequest
+				code = "INVALID_LEASE_LABEL"
+			} else if errors.Is(err, lease.ErrInvalidConflictKey) {
+				status = http.StatusBadRequest
+				code = "INVALID_CONFLICT_KEY"
+			} else if errors.Is(err, lease.ErrAcquireTimeout) {
+				code = "LEASE_ACQUIRE_TIMEOUT"
+			} else if errors.Is(err, lease.ErrAllocationPaused) {
+				code = "ALLOCATION_PAUSED"
+			}
+			w.WriteHeader(status)
+			writeJSON(w, map[string]any{"error": err.Error(), "code": code})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(grant)
+	case http.MethodDelete:
+		if err := controller.Release(r.Context(), r.Header.Get("X-Lease-Token")); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": "release lease failed"})
+			return
+		}
+		writeJSON(w, map[string]any{"released": true})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleProxyRuntime 返回供 WebUI 使用的脱敏 Lease Runtime 摘要。
+// Lease Token 和带凭据的 Proxy URL 只存在于申请成功响应，不得进入此长期可查询接口。
+func (s *Server) handleProxyRuntime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		writeJSON(w, lease.Snapshot{Enabled: false})
+		return
+	}
+	if s.subRefresher != nil {
+		status := s.subRefresher.Status()
+		controller.UpdateOperationalState(true, lease.RefreshSummary{
+			LastRefresh: status.LastRefresh, NextRefresh: status.NextRefresh, NodeCount: status.NodeCount,
+			LastError: status.LastError, RefreshCount: status.RefreshCount, IsRefreshing: status.IsRefreshing,
+			TriggerReason: status.TriggerReason, BackoffAttempt: status.BackoffAttempt, NextRetry: status.NextRetry,
+			Phase: status.Phase, ConfigRevision: status.ConfigRevision, SharedWaiters: status.SharedWaiters,
+		})
+	} else {
+		controller.UpdateOperationalState(true, lease.RefreshSummary{})
+	}
+	snapshot := controller.Snapshot()
+	if state := strings.TrimSpace(r.URL.Query().Get("lease_state")); state != "" {
+		filtered := snapshot.ActiveLeases[:0]
+		for _, currentLease := range snapshot.ActiveLeases {
+			if string(currentLease.State) == state {
+				filtered = append(filtered, currentLease)
+			}
+		}
+		snapshot.ActiveLeases = filtered
+	}
+	leaseLimit := firstQueryValue(r, "lease_limit", "limit")
+	leaseCursor := firstQueryValue(r, "lease_cursor", "cursor")
+	snapshot.ActiveLeases, snapshot.LeaseNextCursor = paginateSlice(snapshot.ActiveLeases, leaseLimit, leaseCursor)
+	if role := strings.TrimSpace(r.URL.Query().Get("generation_role")); role != "" {
+		filtered := snapshot.Generations[:0]
+		for _, generation := range snapshot.Generations {
+			if strings.EqualFold(string(generation.Role), role) {
+				filtered = append(filtered, generation)
+			}
+		}
+		snapshot.Generations = filtered
+	}
+	snapshot.Generations, snapshot.GenerationNextCursor = paginateSlice(snapshot.Generations, r.URL.Query().Get("generation_limit"), r.URL.Query().Get("generation_cursor"))
+	if state := strings.TrimSpace(r.URL.Query().Get("node_state")); state != "" {
+		filtered := snapshot.Nodes[:0]
+		for _, node := range snapshot.Nodes {
+			if nodeMatchesState(node, state) {
+				filtered = append(filtered, node)
+			}
+		}
+		snapshot.Nodes = filtered
+	}
+	snapshot.Nodes, snapshot.NodeNextCursor = paginateSlice(snapshot.Nodes, r.URL.Query().Get("node_limit"), r.URL.Query().Get("node_cursor"))
+	writeJSON(w, snapshot)
+}
+
+func firstQueryValue(r *http.Request, names ...string) string {
+	for _, name := range names {
+		if value := r.URL.Query().Get(name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// paginateSlice 对已经稳定排序的运行时视图做偏移游标分页。
+// 空 limit 保持兼容并返回完整集合；非法游标从第一页开始，避免越界。
+func paginateSlice[T any](items []T, rawLimit, rawCursor string) ([]T, string) {
+	if rawLimit == "" {
+		return items, ""
+	}
+	limit, _ := strconv.Atoi(rawLimit)
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	offset, _ := strconv.Atoi(rawCursor)
+	if offset < 0 || offset > len(items) {
+		offset = 0
+	}
+	end := offset + limit
+	next := ""
+	if end < len(items) {
+		next = strconv.Itoa(end)
+	} else {
+		end = len(items)
+	}
+	return items[offset:end], next
+}
+
+func nodeMatchesState(node lease.NodeSummary, state string) bool {
+	switch strings.ToLower(state) {
+	case "active", "candidate", "draining":
+		return strings.EqualFold(string(node.Role), state)
+	case "ready":
+		return node.Ready
+	case "idle":
+		return node.Idle
+	case "leased":
+		return node.Leased
+	case "unavailable":
+		return node.Unavailable
+	case "blocked":
+		return node.Blocked
+	case "retired":
+		return node.Retired
+	default:
+		return false
+	}
+}
+
+// handleProxyEvents 通过 SSE 提供可重放的有序 Lease Runtime 事件。
+func (s *Server) handleProxyEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	oldest, latest := controller.EventBounds()
+	// after+1 小于 oldest 表示中间至少缺失一条事件；要求客户端先取快照重建状态。
+	if after > 0 && oldest > 0 && after+1 < oldest {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": "EVENT_CURSOR_EXPIRED", "oldest_sequence": oldest, "latest_sequence": latest,
+		})
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	_, _ = io.WriteString(w, ": connected\n\n")
+	flusher.Flush()
+	for event := range controller.SubscribeEvents(r.Context(), after) {
+		data, err := json.Marshal(event)
+		if err != nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", event.Sequence, data)
+		flusher.Flush()
+	}
+}
+
+func (s *Server) handleProxyAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	events := controller.EventSnapshot(after, strings.TrimSpace(r.URL.Query().Get("type")))
+	if association := strings.TrimSpace(r.URL.Query().Get("association")); association != "" {
+		filtered := events[:0]
+		for _, event := range events {
+			if event.Target == association || event.GenerationID == association || event.NodeKey == association || event.Fingerprint == association {
+				filtered = append(filtered, event)
+			}
+		}
+		events = filtered
+	}
+	events, nextCursor := paginateSlice(events, r.URL.Query().Get("limit"), r.URL.Query().Get("cursor"))
+	writeJSON(w, map[string]any{"events": events, "next_cursor": nextCursor})
+}
+
+func (s *Server) handleProxyNodeBlock(w http.ResponseWriter, r *http.Request) {
+	s.handleProxyNodeControl(w, r, true)
+}
+
+func (s *Server) handleProxyNodeUnblock(w http.ResponseWriter, r *http.Request) {
+	s.handleProxyNodeControl(w, r, false)
+}
+
+// handleProxyNodeControl 执行 Lease Runtime 的跨代际人工阻断或解除。
+func (s *Server) handleProxyNodeControl(w http.ResponseWriter, r *http.Request, block bool) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	var request struct {
+		NodeKey string `json:"node_key"`
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || strings.TrimSpace(request.NodeKey) == "" || strings.TrimSpace(request.Reason) == "" || !request.Confirm {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_NODE_CONTROL_REJECTED", Target: request.NodeKey, Reason: request.Reason, Result: "rejected", Error: "confirmation, target or reason missing"})
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "node_key, confirm=true and non-empty reason are required"})
+		return
+	}
+	var err error
+	if block {
+		err = controller.BlockNode(r.Context(), request.NodeKey, request.Reason)
+	} else {
+		err = controller.UnblockNode(r.Context(), request.NodeKey, request.Reason)
+	}
+	if err != nil {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_NODE_CONTROL_FAILED", Target: request.NodeKey, Reason: request.Reason, Result: "failed", Error: err.Error()})
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleProxyAdminPause(w http.ResponseWriter, r *http.Request) {
+	s.handleProxyAllocationControl(w, r, true)
+}
+
+func (s *Server) handleProxyAdminResume(w http.ResponseWriter, r *http.Request) {
+	s.handleProxyAllocationControl(w, r, false)
+}
+
+func (s *Server) handleProxyAllocationControl(w http.ResponseWriter, r *http.Request, pause bool) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	var request struct {
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || !request.Confirm || strings.TrimSpace(request.Reason) == "" {
+		eventType := "ADMIN_ALLOCATION_RESUME_REJECTED"
+		if pause {
+			eventType = "ADMIN_ALLOCATION_PAUSE_REJECTED"
+		}
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: eventType, Reason: request.Reason, Result: "rejected", Error: "confirmation or reason missing"})
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "confirm=true and non-empty reason are required"})
+		return
+	}
+	var err error
+	if pause {
+		err = controller.PauseAllocation(r.Context(), request.Reason)
+	} else {
+		err = controller.ResumeAllocation(r.Context(), request.Reason)
+	}
+	if err != nil {
+		eventType := "ADMIN_ALLOCATION_RESUME_FAILED"
+		if pause {
+			eventType = "ADMIN_ALLOCATION_PAUSE_FAILED"
+		}
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: eventType, Reason: request.Reason, Result: "failed", Error: err.Error()})
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleProxyAdminRevokeLease(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	var request struct {
+		Target  string `json:"target"`
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || !request.Confirm || strings.TrimSpace(request.Reason) == "" || strings.TrimSpace(request.Target) == "" {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_LEASE_REVOKE_REJECTED", Target: request.Target, Reason: request.Reason, Result: "rejected", Error: "confirmation, target or reason missing"})
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "target, confirm=true and non-empty reason are required"})
+		return
+	}
+	if err := controller.RevokeLease(r.Context(), request.Target, request.Reason); err != nil {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_LEASE_REVOKE_FAILED", Target: request.Target, Reason: request.Reason, Result: "failed", Error: err.Error()})
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleProxyAdminAbortCandidate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	var request struct {
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || !request.Confirm || strings.TrimSpace(request.Reason) == "" {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_CANDIDATE_ABORT_REJECTED", Reason: request.Reason, Result: "rejected", Error: "confirmation or reason missing"})
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "confirm=true and non-empty reason are required"})
+		return
+	}
+	if err := controller.AbortCandidate(r.Context(), request.Reason); err != nil {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_CANDIDATE_ABORT_FAILED", Reason: request.Reason, Result: "failed", Error: err.Error()})
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleProxyAdminForceCloseGeneration(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	controller := s.currentLeaseController()
+	if controller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	var request struct {
+		Target  string `json:"target"`
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || !request.Confirm || strings.TrimSpace(request.Reason) == "" || strings.TrimSpace(request.Target) == "" {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_DRAINING_FORCE_CLOSE_REJECTED", Target: request.Target, Reason: request.Reason, Result: "rejected", Error: "confirmation, target or reason missing"})
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "target, confirm=true and non-empty reason are required"})
+		return
+	}
+	if err := controller.ForceCloseGeneration(r.Context(), request.Target, request.Reason); err != nil {
+		controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_DRAINING_FORCE_CLOSE_FAILED", Target: request.Target, Reason: request.Reason, Result: "failed", Error: err.Error()})
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 // withAuth 认证中间件，如果配置了密码则需要验证
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -642,6 +1148,9 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		// 未授权
+		if controller := s.currentLeaseController(); controller != nil && (strings.HasPrefix(r.URL.Path, "/api/proxy-admin/") || strings.HasPrefix(r.URL.Path, "/api/proxy-nodes/")) {
+			controller.RecordAuditEvent(lease.RuntimeEvent{Type: "ADMIN_AUTHORIZATION_REJECTED", Target: r.URL.Path, Result: "rejected", Error: "unauthorized"})
+		}
 		w.WriteHeader(http.StatusUnauthorized)
 		writeJSON(w, map[string]any{"error": "未授权，请先登录"})
 	}

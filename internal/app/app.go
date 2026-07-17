@@ -42,6 +42,19 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer boxMgr.Close()
 
+	var leaseSvc *leaseService
+	if cfg.LeaseGateway.Enabled {
+		initialCandidate, err := boxmgr.BuildLeaseCandidate(ctx, cfg, "generation-1")
+		if err != nil {
+			return fmt.Errorf("build initial Lease Generation: %w", err)
+		}
+		leaseSvc, err = startLeaseServiceWithCandidate(ctx, cfg, boxMgr.MonitorServer(), initialCandidate)
+		if err != nil {
+			return fmt.Errorf("start Lease Gateway: %w", err)
+		}
+		defer leaseSvc.Close(context.Background())
+	}
+
 	// Wire up config to monitor server for settings API
 	if server := boxMgr.MonitorServer(); server != nil {
 		server.SetConfig(cfg)
@@ -49,6 +62,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	// Always create SubscriptionManager so WebUI can hot-reload subscription config
 	subMgr := subscription.New(cfg, boxMgr)
+	if leaseSvc != nil {
+		subMgr.SetLeaseGenerationRefresher(leaseSvc)
+		leaseSvc.SetDegradedTrigger(subMgr.TriggerDegradedRecovery)
+	}
 	defer subMgr.Stop()
 
 	// Start refresh loop only if subscriptions are already configured
@@ -84,6 +101,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	fmt.Println("Stopping box manager...")
+	if leaseSvc != nil {
+		fmt.Println("Stopping Lease Gateway...")
+		if err := leaseSvc.Close(shutdownCtx); err != nil {
+			fmt.Printf("Error closing Lease Gateway: %v\n", err)
+		}
+	}
 	if err := boxMgr.Close(); err != nil {
 		fmt.Printf("Error closing box manager: %v\n", err)
 	}

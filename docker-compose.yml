@@ -1,17 +1,30 @@
 services:
   easy_proxies:
-    image: ghcr.io/jasonwong1991/easy_proxies:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GOPROXY: https://goproxy.cn,direct
+    image: easy_proxies:local
     container_name: easy_proxies
     restart: unless-stopped
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）
     network_mode: host
     user: "${UID:-10001}:${GID:-10001}"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # 方式二：手动映射端口（注释掉 network_mode，启用下面的 ports）
     # ports:
     #   # Pool 模式入口（pool/hybrid 模式使用）
     #   - "2323:2323"
+    #   # GeoIP 路由入口
+    #   - "1221:1221"
     #   # Web 监控面板
     #   - "9091:9091"
+    #   # Lease Gateway
+    #   - "2330:2330"
     #   # Multi-port 端口范围（multi-port/hybrid 模式使用，根据节点数量调整）
     #   - "24000-24200:24000-24200"
     #

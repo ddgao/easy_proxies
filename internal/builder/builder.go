@@ -64,19 +64,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if i > 0 && i%1000 == 0 {
 			log.Printf("⏳ Building nodes... %d/%d", i, totalNodes)
 		}
-		baseTag := sanitizeTag(node.Name)
-		if baseTag == "" {
-			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
-		}
-
-		// Ensure tag uniqueness by appending a counter if needed
-		tag := baseTag
-		if count, exists := usedTags[baseTag]; exists {
-			usedTags[baseTag] = count + 1
-			tag = fmt.Sprintf("%s-%d", baseTag, count+1)
-		} else {
-			usedTags[baseTag] = 1
-		}
+		tag := nextNodeOutboundTag(node.Name, len(memberTags), usedTags)
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
@@ -405,6 +393,64 @@ func Build(cfg *config.Config) (option.Options, error) {
 		},
 	}
 	return opts, nil
+}
+
+// LeaseBuildResult 是 Lease-only sing-box 代际的构建结果。
+// Options 只包含基础节点 outbounds，不包含 Legacy inbounds、pool、GeoIP Router 或 Clash API。
+type LeaseBuildResult struct {
+	Options  option.Options
+	NodeTags map[string]string
+}
+
+// BuildLeaseGeneration 构建不占用任何监听端口的 Lease-only sing-box 配置。
+// 单个节点构建失败时跳过该节点；调用方通过后续最小 Ready 门槛决定 Candidate 是否可提升。
+func BuildLeaseGeneration(cfg *config.Config) (LeaseBuildResult, error) {
+	if cfg == nil {
+		return LeaseBuildResult{}, errors.New("config is nil")
+	}
+	outbounds := make([]option.Outbound, 0, len(cfg.Nodes))
+	nodeTags := make(map[string]string, len(cfg.Nodes))
+	usedTags := make(map[string]int, len(cfg.Nodes))
+	successful := 0
+	for i := range cfg.Nodes {
+		node := cfg.Nodes[i]
+		tag := nextNodeOutboundTag(node.Name, successful, usedTags)
+		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
+		if err != nil {
+			continue
+		}
+		key := node.LeaseNodeKey()
+		if key == "" {
+			continue
+		}
+		outbounds = append(outbounds, outbound)
+		nodeTags[key] = tag
+		successful++
+	}
+	if len(outbounds) == 0 {
+		return LeaseBuildResult{}, errors.New("no valid node outbound for Lease Generation")
+	}
+	return LeaseBuildResult{
+		Options: option.Options{
+			Log:       &option.LogOptions{Level: strings.ToLower(cfg.LogLevel)},
+			Outbounds: outbounds,
+		},
+		NodeTags: nodeTags,
+	}, nil
+}
+
+func nextNodeOutboundTag(name string, successful int, usedTags map[string]int) string {
+	baseTag := sanitizeTag(name)
+	if baseTag == "" {
+		baseTag = fmt.Sprintf("node-%d", successful+1)
+	}
+	tag := baseTag
+	if count, exists := usedTags[baseTag]; exists {
+		usedTags[baseTag] = count + 1
+		return fmt.Sprintf("%s-%d", baseTag, count+1)
+	}
+	usedTags[baseTag] = 1
+	return tag
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {

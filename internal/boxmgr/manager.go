@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,9 +19,11 @@ import (
 	"easy_proxies/internal/outbound/pool"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // Ensure Manager implements monitor.NodeManager.
@@ -403,6 +406,15 @@ func (m *Manager) MonitorServer() *monitor.Server {
 	return m.monitorServer
 }
 
+// singBoxNodeDialer 将 sing-box 的 Socksaddr 拨号接口适配为 Lease Runtime 使用的标准地址接口。
+type singBoxNodeDialer struct {
+	outbound adapter.Outbound
+}
+
+func (d singBoxNodeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return d.outbound.DialContext(ctx, network, M.ParseSocksaddr(address))
+}
+
 // startGeoIPRouter starts the GeoIP region-routing HTTP proxy server.
 func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 	// Stop existing router if any
@@ -541,7 +553,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 				if poolOpts, ok := ob.Options.(*pool.Options); ok {
 					poolOpts.Members = removeFromSlice(poolOpts.Members, badTag)
 					delete(poolOpts.Metadata, badTag)
-					
+
 					// If the pool is now empty, remove it to avoid another validation error
 					if len(poolOpts.Members) == 0 {
 						log.Printf("⚠️  Removing empty pool '%s'", ob.Tag)
@@ -952,7 +964,6 @@ func extractPortFromBindError(err error) uint16 {
 	}
 	return 0
 }
-
 
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
 func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {

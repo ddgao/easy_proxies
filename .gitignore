@@ -6,6 +6,8 @@ easy_proxies-*
 *.exe
 
 # Configuration (contains sensitive data)
+.env
+.env.*
 config.yaml
 nodes.txt
 node_ports.json

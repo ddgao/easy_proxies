@@ -1,7 +1,14 @@
 .git
+.env
+.env.*
 Dockerfile
 config.yaml
 config*.yml
+data
+logs
+nodes.txt
+node_ports.json
+*.mmdb
 *.md
 bin
 **/node_modules

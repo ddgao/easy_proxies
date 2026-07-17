@@ -98,6 +98,54 @@ sticky:
   port: 2324    # 留空或 0 则默认为 listener.port + 1
 ```
 
+## 节点租约 Gateway
+
+Lease Gateway 适合“一个业务任务包含多次 HTTP 请求，任务内必须固定同一节点；存在业务冲突的并发任务需要不同节点”的调用方式。该能力默认关闭，启用后监听独立的 HTTP 代理端口 `2330`，不改变 `2323`、`2324` 或 `24000+` 的现有行为。
+
+```yaml
+lease_gateway:
+  enabled: true
+  listen: 127.0.0.1
+  port: 2330
+  min_ready_nodes: 50
+  probe_expected_status: 204
+  # probe_fallback_target: https://fallback.example/generate_204
+  api_token: "replace-with-a-long-random-machine-token"
+```
+
+主探测 URL 使用 `management.probe_target`，必须是完整的 HTTP(S) URL。节点只有通过主目标或备用目标的协议、路径、TLS 和状态码校验后才会进入租约队列；首次启动不足 `min_ready_nodes` 时 Gateway 保持监听但申请返回 `503`，不影响 Legacy 入口。
+
+申请租约：
+
+```bash
+curl -X POST http://127.0.0.1:9091/api/proxy-leases \
+  -H 'Authorization: Bearer replace-with-a-long-random-machine-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"label":"crawl-one","conflict_key":"account:100"}'
+```
+
+成功响应中的 `proxy_url` 已包含本次租约的 Basic 凭据，可直接同时传给 `requests` 和 `curl_cffi`。任务结束后在 `finally` 中幂等释放：
+
+```bash
+curl -X DELETE http://127.0.0.1:9091/api/proxy-leases \
+  -H 'Authorization: Bearer replace-with-a-long-random-machine-token' \
+  -H 'X-Lease-Token: <lease_token>'
+```
+
+`conflict_key` 由调用方按“业务类型:稳定业务 ID”生成，首尾空白会被移除、大小写敏感，最长 128 字节。相同冲突键的并发租约不能使用同一 Node Key；不同冲突键拥有独立 FIFO 队列，可以共享同一节点且不设置共享上限。省略或传空值时进入默认冲突域，保持旧调用方的节点独占行为。
+
+Lease Token 只在申请响应中返回；`conflict_key` 原文也不会进入运行时快照、日志或 WebUI，监控面仅显示不可用于代理认证或反查业务标识的短指纹。租约流量不会在请求失败后自动切换节点。订阅刷新会并行验证 Candidate，达标后新租约进入新 Active；刷新前签发的租约仍固定在原代际和原 Node Key，直到释放或到期。
+
+每个租约冲突域维护独立的严格 FIFO 空闲节点队列；节点完成排空、验证或恢复后进入该域队尾。域内无空闲节点时申请最多等待 `acquire_wait_timeout`。释放或到期后立即拒绝新连接，已有连接最多排空 `drain_timeout`；排空期间仅在原冲突域内继续占用 Node Key。旧代际最多保留到 `generation_drain_timeout`，排空期间的新刷新只保存最新订阅快照，不创建第三个代际。
+
+运维接口：
+
+- `GET /health/live` 与 `GET /health/ready`：分别检查进程存活和 Lease 可分配容量。
+- `GET /api/proxy-runtime`：统一脱敏快照；租约、节点、代际分别支持 `lease_*`、`node_*`、`generation_*` 分页参数及状态筛选。
+- `GET /api/proxy-events?after=<sequence>`：SSE 有序事件；返回 `409 EVENT_CURSOR_EXPIRED` 时先重新读取快照，再从 `event_latest_sequence` 继续。
+- `POST /api/proxy-admin/pause|resume|revoke-lease|abort-candidate|force-close-generation`：人工处置，必须使用 WebUI 管理会话，并提交 `confirm: true` 和非空 `reason`。
+- `POST /api/proxy-nodes/block|unblock`：按 Node Key 跨代际阻断或复检解除；所有操作与拒绝结果都进入 `/api/proxy-audit`。
+
 ## DNS 配置说明
 
 `dns` 会同时影响 sing-box DNS 客户端和 VMess 域名拨号解析：

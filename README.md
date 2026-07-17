@@ -123,6 +123,31 @@ sticky:
   port: 2324    # defaults to listener.port + 1 when omitted
 ```
 
+### Node Lease Gateway
+
+Lease Gateway is for automated jobs that must keep one upstream node across multiple HTTP requests while conflicting concurrent jobs receive different nodes. It is disabled by default and uses a dedicated HTTP proxy port without changing the existing 2323, 2324, or 24000+ entry points.
+
+```yaml
+lease_gateway:
+  enabled: true
+  listen: 127.0.0.1
+  port: 2330
+  min_ready_nodes: 50
+  probe_expected_status: 204
+  # probe_fallback_target: https://fallback.example/generate_204
+  api_token: "replace-with-a-long-random-machine-token"
+```
+
+The primary probe URL comes from `management.probe_target` and must be an absolute HTTP(S) URL. A node enters the lease queue only after the configured protocol, path, TLS policy, and status check succeeds against the primary or fallback target. If initial admission is below `min_ready_nodes`, the Gateway stays live but lease acquisition returns `503`; Legacy entry points remain available.
+
+Acquire a lease through `POST /api/proxy-leases` with `Authorization: Bearer <api_token>` and an optional `{"label":"crawl-one","conflict_key":"account:100"}` body. Callers derive `conflict_key` from a stable business identifier; equal keys cannot use the same Node Key concurrently, while different keys have independent FIFO queues and may share a node without a lease-count limit. Missing or blank keys use the default conflict domain and retain the previous exclusive behavior. The response contains a ready-to-use `proxy_url` and a one-time `lease_token`. Release it idempotently with `DELETE /api/proxy-leases`, the same API authorization, and `X-Lease-Token: <lease_token>`.
+
+Lease Tokens and raw conflict keys never appear in monitoring responses or the WebUI; only short, non-credential fingerprints are exposed. Leased traffic does not automatically fail over to another node. Subscription refresh builds and validates a Candidate generation in parallel. New leases use it only after promotion; leases issued before promotion remain bound to their original generation and Node Key until release or expiry.
+
+Each conflict domain owns a strict FIFO idle-node queue. Nodes join its tail after validation, recovery, or lease draining; acquisition waits up to `acquire_wait_timeout` when that domain is exhausted. Release or expiry rejects new connections immediately and drains existing connections for at most `drain_timeout`, retaining Node Key ownership only inside the original conflict domain. A previous generation drains for at most `generation_drain_timeout`, and refreshes received while two generations are alive retain only the latest subscription snapshot.
+
+Operational endpoints include `GET /health/live`, `GET /health/ready`, the unified and paginated `GET /api/proxy-runtime` snapshot, resumable `GET /api/proxy-events?after=<sequence>` SSE, and filtered `GET /api/proxy-audit`. High-impact `/api/proxy-admin/*` and `/api/proxy-nodes/*` actions require WebUI authentication, `confirm: true`, and a non-empty reason; accepted, rejected, and failed actions are audited without credentials.
+
 ### Full Config Reference
 
 See [config.example.yaml](config.example.yaml) for the full documented configuration with all available options.

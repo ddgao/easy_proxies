@@ -215,7 +215,58 @@
       .overview-grid { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 768px) {
-      .overview-grid { grid-template-columns: repeat(2, 1fr); }
+      body { flex-direction: column; }
+      .sidebar {
+        width: 100%;
+        height: auto;
+        flex: none;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .brand, .sidebar-footer { display: none; }
+      .nav {
+        display: flex;
+        flex: none;
+        overflow-x: auto;
+        padding: 0;
+      }
+      .nav-item {
+        flex: 0 0 auto;
+        padding: 10px 12px;
+        gap: 6px;
+        white-space: nowrap;
+      }
+      .nav-item.active {
+        border-right: 0;
+        border-bottom: 3px solid var(--primary);
+      }
+      .main { width: 100%; min-width: 0; }
+      .header {
+        height: auto;
+        min-height: 52px;
+        padding: 8px 12px;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .header-left { flex: 1 1 auto; min-width: 0; }
+      .header-actions {
+        width: 100%;
+        overflow-x: auto;
+        padding-bottom: 4px;
+      }
+      .header-actions > * { flex: 0 0 auto; }
+      .content { padding: 12px; }
+      .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .stat-panel { min-width: 0; padding: 12px; }
+      .stat-value { font-size: 24px; overflow-wrap: anywhere; }
+      .stat-sub { overflow-wrap: anywhere; }
+      .panel-header { align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+      .panel-header > div:last-child { max-width: 100%; overflow-x: auto; }
+      .charts-grid { grid-template-columns: minmax(0, 1fr); }
+      .chart-panel { min-width: 0; height: 280px; }
+      .modal { width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow-y: auto; }
+      .checkbox-grid { grid-template-columns: 1fr; }
+      .toast-container { left: 12px; right: 12px; bottom: 12px; }
     }
     .stat-panel {
       background: var(--bg-panel);
@@ -328,6 +379,10 @@
       margin-bottom: 16px;
     }
     label { font-size: 12px; color: var(--text-muted); }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
     input[type="text"], input[type="password"], input[type="number"] {
       background: var(--bg-input); border: 1px solid var(--border); color: var(--text-main);
       padding: 8px 12px; border-radius: 6px; font-family: var(--font-mono); font-size: 13px; outline: none;
@@ -429,11 +484,11 @@
         系统设置
       </div>
     </div>
-    <div style="padding: 0 20px 16px; text-align: center;">
+    <div class="sidebar-footer" style="padding: 0 20px 16px; text-align: center;">
       <a href="https://github.com/jasonwong1991/easy_proxies" target="_blank" rel="noopener" style="display:inline-flex; align-items:center; gap:6px; color:var(--text-muted); text-decoration:none; font-size:12px; padding:6px 10px; border-radius:6px; border:1px solid var(--border); transition:all 0.2s;" onmouseover="this.style.borderColor='var(--primary)';this.style.color='var(--text-main)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
-        <span id="githubStars">-</span>
+        <span id="githubStars">GitHub</span>
       </a>
     </div>
   </aside>
@@ -498,6 +553,46 @@
             <div class="stat-sub">不可用节点</div>
           </div>
           <div class="stat-panel">
+            <div class="stat-title">Lease Gateway</div>
+            <div class="stat-value" style="font-size: 22px;" id="leaseGatewayStatus">关闭</div>
+            <div class="stat-sub" style="color: var(--text-muted);">稳定租约入口</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">活动租约</div>
+            <div class="stat-value" style="color: var(--primary);" id="activeLeaseCount">0</div>
+            <div class="stat-sub" style="color: var(--text-muted);">Lease Gateway</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">当前活动代</div>
+            <div class="stat-value tt-mono" style="font-size: 18px;" id="activeGenerationID">-</div>
+            <div class="stat-sub" style="color: var(--text-muted);">新租约分配目标</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">健康准入</div>
+            <div class="stat-value" style="font-size: 22px;" id="leaseValidationStatus">0 / 0</div>
+            <div class="stat-sub" style="color: var(--text-muted);" id="leaseValidationDetail">等待探测</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">默认域空闲节点</div>
+            <div class="stat-value" id="idleLeaseNodeCount">0</div>
+            <div class="stat-sub">Idle Node Queue</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">等待申请</div>
+            <div class="stat-value" id="leaseWaiterCount">0</div>
+            <div class="stat-sub">FIFO Waiters</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">租约节点比</div>
+            <div class="stat-value" id="leaseUtilization">0 / 0</div>
+            <div class="stat-sub" id="leaseDegradedStatus">正常</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">刷新协调</div>
+            <div class="stat-value" style="font-size: 18px;" id="leaseRefreshStatus">IDLE</div>
+            <div class="stat-sub" id="leaseRefreshDetail">revision 0</div>
+          </div>
+          <div class="stat-panel">
             <div class="stat-title">↑ 上行速率</div>
             <div class="stat-value" style="color: #3b82f6; font-size: 22px;" id="liveUpSpeed">0 B/s</div>
             <div class="stat-sub" style="color: var(--text-muted);">实时上传</div>
@@ -506,6 +601,82 @@
             <div class="stat-title">↓ 下行速率</div>
             <div class="stat-value" style="color: #10b981; font-size: 22px;" id="liveDownSpeed">0 B/s</div>
             <div class="stat-sub" style="color: var(--text-muted);">实时下载</div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom: 24px;">
+          <div class="panel-header">
+            <div class="panel-title">Lease 运行代际</div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-sm btn-warning" id="pauseLeaseAllocationBtn" onclick="runLeaseAdminAction('pause')">暂停分配</button>
+              <button class="btn btn-sm" onclick="runLeaseAdminAction('resume')">恢复分配</button>
+              <button class="btn btn-sm btn-danger" onclick="runLeaseAdminAction('abort-candidate')">中止 Candidate</button>
+            </div>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>代际 ID</th>
+                  <th>角色</th>
+                  <th>构建阶段</th>
+                  <th>Ready 进度</th>
+                  <th>节点容量</th>
+                  <th>Retired</th>
+                  <th>剩余租约/连接</th>
+                  <th>错误摘要</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="leaseGenerationRows">
+                <tr><td colspan="9" style="color: var(--text-muted);">暂无运行代际</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom: 24px;">
+          <div class="panel-header">
+            <div class="panel-title">当前节点租约</div>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Token 指纹</th>
+                  <th>冲突域指纹</th>
+                  <th>标签</th>
+                  <th>Node Key</th>
+                  <th>所属代际</th>
+                  <th>状态</th>
+                  <th>连接</th>
+                  <th>到期时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="leaseSummaryRows">
+                <tr><td colspan="9" style="color: var(--text-muted);">暂无活动租约</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom: 24px;">
+          <div class="panel-header"><div class="panel-title">Lease 节点状态</div></div>
+          <div class="table-container"><table>
+            <thead><tr><th>代际</th><th>Node Key</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="leaseNodeRows"><tr><td colspan="5" style="color: var(--text-muted);">暂无节点状态</td></tr></tbody>
+          </table></div>
+          <div style="padding:12px 16px; text-align:center;"><button class="btn btn-sm" id="leaseNodeMoreBtn" onclick="loadMoreLeaseNodes()" style="display:none;">加载更多</button></div>
+        </div>
+
+        <div class="panel" style="margin-bottom: 24px;">
+          <div class="panel-header"><div class="panel-title">Lease 审计时间线</div></div>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>序号</th><th>时间</th><th>类型</th><th>目标</th><th>操作者</th><th>原因</th><th>结果</th></tr></thead>
+              <tbody id="leaseAuditRows"><tr><td colspan="7" style="color: var(--text-muted);">暂无审计记录</td></tr></tbody>
+            </table>
           </div>
         </div>
 
@@ -649,6 +820,7 @@
             </div>
           </div>
           <div style="padding: 0;">
+            <label class="sr-only" for="consoleLogs">运行日志</label>
             <textarea id="consoleLogs" readonly style="width:100%; height:calc(100vh - 220px); min-height:400px; background:var(--bg-input); color:var(--text-main); font-family:'JetBrains Mono',monospace; font-size:12px; line-height:1.7; border:none; border-top:1px solid var(--border); padding:16px; resize:none; box-sizing:border-box; white-space:pre; overflow-x:auto;"></textarea>
           </div>
         </div>
@@ -680,7 +852,7 @@
                   <input type="text" id="settingProbeTarget" class="setting-input" placeholder="www.apple.com:80" />
                 </div>
                 <div class="form-group" style="justify-content:flex-end;">
-                  <label>&nbsp;</label>
+                  <span aria-hidden="true">&nbsp;</span>
                   <div class="checkbox-row"><input type="checkbox" id="settingSkipCertVerify" /><label for="settingSkipCertVerify">跳过 SSL 证书验证</label></div>
                 </div>
               </div>
@@ -780,7 +952,7 @@
                   <div class="form-group"><label>保留旧日志个数</label><input type="number" id="settingLogMaxBackups" class="setting-input" min="0" max="100" placeholder="3" /></div>
                   <div class="form-group"><label>保留天数</label><input type="number" id="settingLogMaxAge" class="setting-input" min="0" max="365" placeholder="7" /></div>
                   <div class="form-group" style="justify-content:flex-end;">
-                    <label>&nbsp;</label>
+                    <span aria-hidden="true">&nbsp;</span>
                     <div class="checkbox-row"><input type="checkbox" id="settingLogCompress" /><label for="settingLogCompress">压缩旧日志</label></div>
                   </div>
                 </div>
@@ -831,8 +1003,8 @@
       <form onsubmit="handleLogin(event)">
         <div class="modal-body">
           <div class="form-group">
-            <label>系统密码</label>
-            <input type="password" id="password" required placeholder="Enter password..." />
+            <label for="password">系统密码</label>
+            <input type="password" id="password" required autocomplete="current-password" placeholder="Enter password..." />
           </div>
           <div id="loginError" style="color: var(--error); font-size: 12px; display: none;"></div>
         </div>
@@ -958,7 +1130,7 @@
       const err = document.getElementById('loginError');
       try {
         const res = await fetch('/api/auth', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password:pwd})});
-        if (res.ok) { document.getElementById('loginOverlay').classList.remove('show'); refresh(); }
+        if (res.ok) { document.getElementById('loginOverlay').classList.remove('show'); refresh(); startProxyEvents(); }
         else { err.textContent = 'Auth Failed'; err.style.display = 'block'; }
       } catch (ex) { err.textContent = ex.message; err.style.display = 'block'; }
     }
@@ -1035,6 +1207,16 @@
         .replace(/"/g,'&quot;');
     }
 
+    function associateFormLabels() {
+      document.querySelectorAll('.form-group').forEach((group, index) => {
+        const label = group.querySelector(':scope > label');
+        const field = group.querySelector(':scope > input, :scope > textarea, :scope > select');
+        if (!label || !field) return;
+        if (!field.id) field.id = `form-field-${index}`;
+        label.htmlFor = field.id;
+      });
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/nodes');
@@ -1046,7 +1228,192 @@
         document.getElementById('lastUpdate').textContent = `Sync: ${new Date().toLocaleTimeString()}`;
         updateSweepProgress(data.probe_sweep);
         fetchSubscriptionStatus();
+        fetchLeaseRuntime();
       } catch(e) {}
+    }
+
+    let leaseNodeNextCursor = '';
+    let leaseNodeRowsCache = [];
+
+    async function fetchLeaseRuntime() {
+      try {
+        const res = await fetch('/api/proxy-runtime?node_limit=100&lease_limit=100&generation_limit=20');
+        if (!res.ok) return;
+        const runtime = await res.json();
+        const status = document.getElementById('leaseGatewayStatus');
+        status.textContent = runtime.ready ? '运行中' : (runtime.enabled ? '准入中' : '关闭');
+        status.style.color = runtime.ready ? 'var(--success)' : (runtime.enabled ? 'var(--warning)' : 'var(--text-muted)');
+        const liveGenerations = runtime.generations || [];
+        const generations = [...liveGenerations, ...(runtime.recent_generations || []).slice().reverse()];
+        const activeGeneration = liveGenerations.find(generation => generation.role === 'ACTIVE');
+        document.getElementById('activeGenerationID').textContent = activeGeneration ? activeGeneration.id : '-';
+        const validation = runtime.validation || {};
+        const validationReady = validation.ready || 0;
+        const validationTotal = validation.total || 0;
+        document.getElementById('leaseValidationStatus').textContent = `${validationReady} / ${validation.min_ready || 0}`;
+        document.getElementById('leaseValidationDetail').textContent = validationTotal
+          ? `总数 ${validationTotal} · 验证中 ${validation.validating || 0} · 失败 ${validation.failed || 0}`
+          : '等待探测';
+        document.getElementById('leaseGenerationRows').innerHTML = generations.length ? generations.map(generation => {
+          const badgeClass = generation.role === 'ACTIVE' ? 'badge-healthy' : (generation.role === 'CANDIDATE' ? 'badge-warning' : 'badge-offline');
+          return `<tr>
+            <td class="tt-mono">${escapeHtml(generation.id || '-')}</td>
+            <td><span class="badge ${badgeClass}">${escapeHtml(generation.role || '-')}</span></td>
+            <td>${escapeHtml(generation.build_phase || '-')}</td>
+            <td>${generation.ready_count || 0} / ${generation.node_count || 0}</td>
+            <td>${generation.node_count || 0}</td>
+            <td>${generation.retired_node_count || 0}</td>
+            <td>${generation.remaining_leases || 0} / ${generation.remaining_connections || 0}</td>
+            <td><span class="cell-trunc" title="${escapeHtml(generation.error_summary || '')}">${escapeHtml(generation.error_summary || '-')}</span></td>
+            <td>${generation.role === 'DRAINING' && generation.build_phase === 'DRAINING' ? `<button class="btn btn-sm btn-danger" onclick="runLeaseTargetAdminAction('force-close-generation','${escapeAttrJs(generation.id)}','影响 ${generation.remaining_leases || 0} 个租约、${generation.remaining_connections || 0} 个连接')">强制关闭</button>` : '-'}</td>
+          </tr>`;
+        }).join('') : '<tr><td colspan="9" style="color: var(--text-muted);">暂无运行代际</td></tr>';
+        const leases = runtime.active_leases || [];
+        const idleNodes = runtime.default_idle_node_count || 0;
+        document.getElementById('idleLeaseNodeCount').textContent = idleNodes;
+        document.getElementById('leaseWaiterCount').textContent = runtime.waiter_count || 0;
+        document.getElementById('leaseUtilization').textContent = `${leases.length} / ${runtime.ready_node_count || 0}`;
+        const degradedStatus = document.getElementById('leaseDegradedStatus');
+        degradedStatus.textContent = runtime.degraded ? 'Degraded' : (runtime.allocation_paused ? '已暂停' : '正常');
+        degradedStatus.style.color = runtime.degraded ? 'var(--error)' : (runtime.allocation_paused ? 'var(--warning)' : 'var(--text-muted)');
+        const refreshState = runtime.refresh || {};
+        document.getElementById('leaseRefreshStatus').textContent = refreshState.phase || 'IDLE';
+        document.getElementById('leaseRefreshDetail').textContent = runtime.pending_refresh
+          ? `revision ${refreshState.config_revision || 0} · 待排空后执行`
+          : `revision ${refreshState.config_revision || 0} · waiters ${refreshState.shared_waiters || 0}${refreshState.backoff_attempt ? ` · backoff ${refreshState.backoff_attempt}` : ''}`;
+        document.getElementById('activeLeaseCount').textContent = leases.length;
+        document.getElementById('leaseSummaryRows').innerHTML = leases.length ? leases.map(lease => `
+          <tr>
+            <td class="tt-mono">${escapeHtml(lease.token_fingerprint || '-')}</td>
+            <td class="tt-mono">${escapeHtml(lease.conflict_fingerprint || '-')}</td>
+            <td>${escapeHtml(lease.label || '-')}</td>
+            <td class="tt-mono"><span class="cell-trunc" title="${escapeHtml(lease.node_key || '')}">${escapeHtml(lease.node_key || '-')}</span></td>
+            <td class="tt-mono">${escapeHtml(lease.generation_id || '-')}</td>
+            <td><span class="badge ${lease.state === 'ACTIVE' ? 'badge-healthy' : 'badge-warning'}">${escapeHtml(lease.state || '-')}</span></td>
+            <td>${lease.active_connections || 0}</td>
+            <td>${lease.expires_at ? new Date(lease.expires_at).toLocaleTimeString() : '-'}</td>
+            <td><button class="btn btn-sm btn-danger" onclick="runLeaseTargetAdminAction('revoke-lease','${escapeAttrJs(lease.token_fingerprint || '')}','影响 1 个租约、${lease.active_connections || 0} 个连接')">撤销</button></td>
+          </tr>
+        `).join('') : '<tr><td colspan="9" style="color: var(--text-muted);">暂无活动租约</td></tr>';
+        leaseNodeRowsCache = runtime.lease_nodes || [];
+        leaseNodeNextCursor = runtime.node_next_cursor || '';
+        renderLeaseNodes();
+        fetchLeaseAudit();
+        return runtime;
+      } catch(e) {}
+    }
+
+    function renderLeaseNodes() {
+        document.getElementById('leaseNodeRows').innerHTML = leaseNodeRowsCache.length ? leaseNodeRowsCache.map(node => {
+          const state = node.blocked ? 'BLOCKED' : (node.retired ? 'RETIRED' : (node.validation_state || (node.unavailable ? 'UNAVAILABLE' : (node.leased ? `LEASED (${node.active_lease_count || 0})` : (node.idle ? 'IDLE' : 'PENDING')))));
+          return `<tr><td class="tt-mono">${escapeHtml(node.generation_id || '-')}</td>
+            <td class="tt-mono"><span class="cell-trunc" title="${escapeHtml(node.node_key || '')}">${escapeHtml(node.node_key || '-')}</span></td>
+            <td>${escapeHtml(node.generation_role || '-')}</td><td>${state}</td>
+            <td><button class="btn btn-sm ${node.blocked ? '' : 'btn-danger'}" onclick="runLeaseNodeAction('${node.blocked ? 'unblock' : 'block'}','${escapeAttrJs(node.node_key || '')}')">${node.blocked ? '解除' : '阻断'}</button></td></tr>`;
+        }).join('') : '<tr><td colspan="5" style="color: var(--text-muted);">暂无节点状态</td></tr>';
+        const moreButton = document.getElementById('leaseNodeMoreBtn');
+        moreButton.style.display = leaseNodeNextCursor ? 'inline-flex' : 'none';
+    }
+
+    async function loadMoreLeaseNodes() {
+      if (!leaseNodeNextCursor) return;
+      const response = await fetch(`/api/proxy-runtime?node_limit=100&node_cursor=${encodeURIComponent(leaseNodeNextCursor)}&lease_limit=1&generation_limit=1`);
+      if (!response.ok) return;
+      const runtime = await response.json();
+      leaseNodeRowsCache = leaseNodeRowsCache.concat(runtime.lease_nodes || []);
+      leaseNodeNextCursor = runtime.node_next_cursor || '';
+      renderLeaseNodes();
+    }
+
+    let proxyEventSource = null;
+    let lastProxyEventSequence = 0;
+    let leaseRuntimeRefreshTimer = null;
+    let leaseRuntimeRefreshInFlight = false;
+    let leaseRuntimeRefreshPending = false;
+
+    // 节点准入会在短时间内产生大量事件；这里只保留“状态已变化”的信号，
+    // 合并拉取完整快照，避免每个节点事件都触发运行时和审计接口请求。
+    function scheduleLeaseRuntimeRefresh() {
+      leaseRuntimeRefreshPending = true;
+      if (leaseRuntimeRefreshTimer || leaseRuntimeRefreshInFlight) return;
+      leaseRuntimeRefreshTimer = setTimeout(async () => {
+        leaseRuntimeRefreshTimer = null;
+        leaseRuntimeRefreshPending = false;
+        leaseRuntimeRefreshInFlight = true;
+        try {
+          await fetchLeaseRuntime();
+        } finally {
+          leaseRuntimeRefreshInFlight = false;
+          if (leaseRuntimeRefreshPending) scheduleLeaseRuntimeRefresh();
+        }
+      }, 250);
+    }
+
+    async function startProxyEvents() {
+      if (proxyEventSource) return;
+      const runtime = await fetchLeaseRuntime();
+      if (runtime && runtime.event_latest_sequence > lastProxyEventSequence) {
+        lastProxyEventSequence = runtime.event_latest_sequence;
+      }
+      proxyEventSource = new EventSource(`/api/proxy-events?after=${lastProxyEventSequence}`);
+      proxyEventSource.onmessage = event => {
+        const sequence = Number(event.lastEventId || 0);
+        if (sequence && lastProxyEventSequence && sequence !== lastProxyEventSequence + 1) {
+          proxyEventSource.close(); proxyEventSource = null;
+          setTimeout(startProxyEvents, 0);
+          return;
+        }
+        if (sequence) lastProxyEventSequence = sequence;
+        scheduleLeaseRuntimeRefresh();
+      };
+      proxyEventSource.onerror = () => {
+        proxyEventSource.close(); proxyEventSource = null;
+        setTimeout(startProxyEvents, 3000);
+      };
+    }
+
+    async function fetchLeaseAudit() {
+      try {
+        const response = await fetch('/api/proxy-audit?after=0');
+        if (!response.ok) return;
+        const payload = await response.json();
+        const events = (payload.events || []).filter(event => (event.type || '').startsWith('ADMIN_')).slice(-50).reverse();
+        document.getElementById('leaseAuditRows').innerHTML = events.length ? events.map(event => `<tr>
+          <td>${event.sequence}</td><td>${new Date(event.time).toLocaleTimeString()}</td><td>${escapeHtml(event.type || '-')}</td>
+          <td class="tt-mono">${escapeHtml(event.target || event.node_key || event.generation_id || '-')}</td>
+          <td>${escapeHtml(event.operator || '-')}</td><td>${escapeHtml(event.reason || '-')}</td><td>${escapeHtml(event.result || '-')}</td>
+        </tr>`).join('') : '<tr><td colspan="7" style="color: var(--text-muted);">暂无审计记录</td></tr>';
+      } catch(e) {}
+    }
+
+    async function runLeaseAdminAction(action) {
+      const reason = prompt('请输入操作原因');
+      if (!reason || !confirm(`确认执行 ${action}？`)) return;
+      const response = await fetch(`/api/proxy-admin/${action}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({reason, confirm: true})
+      });
+      if (!response.ok) alert((await response.json()).error || '操作失败');
+      fetchLeaseRuntime();
+    }
+
+    async function runLeaseTargetAdminAction(action, target, impact) {
+      const reason = prompt('请输入操作原因');
+      if (!reason || !confirm(`${impact || '该操作会改变运行时状态'}\n确认执行 ${action}？`)) return;
+      const response = await fetch(`/api/proxy-admin/${action}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target, reason, confirm: true})
+      });
+      if (!response.ok) alert((await response.json()).error || '操作失败');
+      fetchLeaseRuntime();
+    }
+
+    async function runLeaseNodeAction(action, nodeKey) {
+      const reason = prompt('请输入操作原因');
+      if (!reason || !confirm(`确认${action}该节点？`)) return;
+      const response = await fetch(`/api/proxy-nodes/${action}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({node_key: nodeKey, reason, confirm: true})
+      });
+      if (!response.ok) alert((await response.json()).error || '操作失败');
+      fetchLeaseRuntime();
     }
 
     // updateSweepProgress reflects the backend initial/periodic health-check
@@ -1845,13 +2212,10 @@
     })();
 
     // Init App
-    checkAuth().then(ok => { if(ok) { refresh(); startAutoRefresh(); } });
+    associateFormLabels();
+    checkAuth().then(ok => { if(ok) { refresh(); startAutoRefresh(); startProxyEvents(); } });
 
     // Fetch GitHub stars
-    fetch('https://api.github.com/repos/jasonwong1991/easy_proxies')
-      .then(r => r.json())
-      .then(d => { if(d.stargazers_count !== undefined) document.getElementById('githubStars').textContent = d.stargazers_count; })
-      .catch(() => {});
   </script>
 </body>
 </html>

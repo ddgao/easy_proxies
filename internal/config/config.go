@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -28,6 +29,7 @@ type Config struct {
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
 	Sticky              StickyConfig              `yaml:"sticky"`
+	LeaseGateway        LeaseGatewayConfig        `yaml:"lease_gateway"`
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
@@ -77,6 +79,21 @@ type ListenerConfig struct {
 type StickyConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Port    uint16 `yaml:"port"`
+}
+
+// LeaseGatewayConfig 定义自动化调用方使用的稳定租约代理入口。
+// 该入口只服务 Lease Token，不复用 Legacy 入口凭据；APIToken 仅用于管理面申请和释放租约。
+type LeaseGatewayConfig struct {
+	Enabled                bool          `yaml:"enabled"`
+	Listen                 string        `yaml:"listen"`
+	Port                   uint16        `yaml:"port"`
+	APIToken               string        `yaml:"api_token"`
+	MinReadyNodes          int           `yaml:"min_ready_nodes"`
+	ProbeFallbackTarget    string        `yaml:"probe_fallback_target"`
+	ProbeExpectedStatus    int           `yaml:"probe_expected_status"`
+	AcquireWaitTimeout     time.Duration `yaml:"acquire_wait_timeout"`
+	DrainTimeout           time.Duration `yaml:"drain_timeout"`
+	GenerationDrainTimeout time.Duration `yaml:"generation_drain_timeout"`
 }
 
 // PoolConfig configures scheduling + failure handling.
@@ -186,6 +203,17 @@ type NodeConfig struct {
 // keeps the same key — and therefore the same proxy port.
 func (n *NodeConfig) NodeKey() string {
 	return stableNodeKey(n.URI)
+}
+
+// LeaseNodeKey 返回可以安全暴露给调用方和监控面的稳定节点标识。
+// 原始 URI 仍用于端口保持，但其中的 UUID、密码、主机和查询参数不得成为 Lease API 数据。
+func (n *NodeConfig) LeaseNodeKey() string {
+	stableKey := stableNodeKey(n.URI)
+	if stableKey == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(stableKey))
+	return "node-" + base64.RawURLEncoding.EncodeToString(digest[:12])
 }
 
 // stableNodeKey derives a port-stable identity from a proxy URI by stripping the
@@ -791,7 +819,84 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if err := c.normalizeSticky(); err != nil {
 		return err
 	}
+	if err := c.normalizeLeaseGateway(); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+// normalizeLeaseGateway 应用稳定入口默认值并阻止与进程内现有代理监听端口冲突。
+// 关闭状态下不填充默认值，确保旧配置序列化和运行行为保持不变。
+func (c *Config) normalizeLeaseGateway() error {
+	if !c.LeaseGateway.Enabled {
+		return nil
+	}
+	if !c.ManagementEnabled() {
+		return errors.New("lease_gateway requires management.enabled=true")
+	}
+	if strings.TrimSpace(c.LeaseGateway.APIToken) == "" {
+		return errors.New("lease_gateway.api_token is required when Lease Gateway is enabled")
+	}
+	c.LeaseGateway.APIToken = strings.TrimSpace(c.LeaseGateway.APIToken)
+	if c.LeaseGateway.Listen == "" {
+		c.LeaseGateway.Listen = "127.0.0.1"
+	}
+	if c.LeaseGateway.Port == 0 {
+		c.LeaseGateway.Port = 2330
+	}
+	if c.LeaseGateway.MinReadyNodes <= 0 {
+		c.LeaseGateway.MinReadyNodes = 50
+	}
+	if c.LeaseGateway.ProbeExpectedStatus == 0 {
+		c.LeaseGateway.ProbeExpectedStatus = http.StatusNoContent
+	}
+	if c.LeaseGateway.AcquireWaitTimeout <= 0 {
+		c.LeaseGateway.AcquireWaitTimeout = 10 * time.Second
+	}
+	if c.LeaseGateway.DrainTimeout <= 0 {
+		c.LeaseGateway.DrainTimeout = 30 * time.Second
+	}
+	if c.LeaseGateway.GenerationDrainTimeout <= 0 {
+		c.LeaseGateway.GenerationDrainTimeout = 2*time.Minute + 30*time.Second
+	}
+	if c.LeaseGateway.ProbeExpectedStatus < 100 || c.LeaseGateway.ProbeExpectedStatus > 599 {
+		return fmt.Errorf("lease_gateway.probe_expected_status %d is invalid", c.LeaseGateway.ProbeExpectedStatus)
+	}
+	if err := validateLeaseProbeURL("management.probe_target", c.Management.ProbeTarget); err != nil {
+		return err
+	}
+	if c.LeaseGateway.ProbeFallbackTarget != "" {
+		if err := validateLeaseProbeURL("lease_gateway.probe_fallback_target", c.LeaseGateway.ProbeFallbackTarget); err != nil {
+			return err
+		}
+	}
+	if c.LeaseGateway.Port == c.Listener.Port {
+		return fmt.Errorf("lease_gateway.port %d conflicts with listener.port", c.LeaseGateway.Port)
+	}
+	if _, rawPort, err := net.SplitHostPort(c.Management.Listen); err == nil {
+		if managementPort, parseErr := strconv.ParseUint(rawPort, 10, 16); parseErr == nil && uint16(managementPort) == c.LeaseGateway.Port {
+			return fmt.Errorf("lease_gateway.port %d conflicts with management.listen", c.LeaseGateway.Port)
+		}
+	}
+	if c.Sticky.Enabled && c.LeaseGateway.Port == c.Sticky.Port {
+		return fmt.Errorf("lease_gateway.port %d conflicts with sticky.port", c.LeaseGateway.Port)
+	}
+	if c.Mode == "multi-port" || c.Mode == "hybrid" {
+		for idx := range c.Nodes {
+			if c.Nodes[idx].Port == c.LeaseGateway.Port {
+				return fmt.Errorf("lease_gateway.port %d conflicts with node %q port", c.LeaseGateway.Port, c.Nodes[idx].Name)
+			}
+		}
+	}
+	return nil
+}
+
+func validateLeaseProbeURL(field, raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return fmt.Errorf("%s must be an absolute http(s) URL when Lease Gateway is enabled", field)
+	}
 	return nil
 }
 
@@ -1923,6 +2028,7 @@ func (c *Config) SaveSettings() error {
 	saveCfg.MultiPort = c.MultiPort
 	saveCfg.Pool = c.Pool
 	saveCfg.Management = c.Management
+	saveCfg.LeaseGateway = c.LeaseGateway
 
 	newData, err := yaml.Marshal(&saveCfg)
 	if err != nil {

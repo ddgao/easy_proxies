@@ -17,7 +17,7 @@ COPY --from=builder /src/easy_proxies /usr/local/bin/easy_proxies
 COPY config.example.yaml /app/config.example.yaml
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-# Pool/Hybrid mode: 2323, Management: 9091, Multi-port/Hybrid mode: 24000-24200
-EXPOSE 2323 9091 24000-24200
+# GeoIP: 1221, Pool/Hybrid: 2323, Lease Gateway: 2330, Management: 9091, Multi-port/Hybrid: 24000-24200
+EXPOSE 1221 2323 2330 9091 24000-24200
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--config", "/etc/easy_proxies/config.yaml"]

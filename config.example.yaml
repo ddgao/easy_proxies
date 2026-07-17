@@ -76,6 +76,25 @@ sticky:
   port: 2324            # 粘性端口（留空或 0 则默认为 listener.port + 1）
 
 # ───────────────────────────────────────────────────────────────
+# 节点租约 Gateway（可选，供自动化任务固定使用一个节点）
+# ───────────────────────────────────────────────────────────────
+# 启用后通过管理 API 申请短期节点租约，再使用返回的 proxy_url 发起 HTTP/HTTPS 请求。
+# Lease Gateway 不改变 2323、2324 或 24000+ 入口的调度和鉴权行为。
+lease_gateway:
+  enabled: false
+  listen: 127.0.0.1
+  port: 2330
+  min_ready_nodes: 50
+  probe_expected_status: 204
+  acquire_wait_timeout: 10s
+  drain_timeout: 30s
+  generation_drain_timeout: 2m30s
+  # probe_fallback_target: https://fallback.example/generate_204
+  # 仅用于 POST/DELETE /api/proxy-leases，不复用 WebUI 密码或单个 Lease Token。
+  api_token: "replace-with-a-long-random-machine-token"
+  # POST 可选传 conflict_key；相同键域内独占节点，不同键可共享节点。省略时保持旧的全局独占行为。
+
+# ───────────────────────────────────────────────────────────────
 # 多端口模式配置（multi-port / hybrid 模式使用）
 # ───────────────────────────────────────────────────────────────
 multi_port:
@@ -90,7 +109,7 @@ multi_port:
 management:
   enabled: true                                      # 是否启用管理面板
   listen: 0.0.0.0:9091                               # 监听地址
-  probe_target: http://cp.cloudflare.com/generate_204  # 健康检查目标
+  probe_target: https://connectivitycheck.gstatic.com/generate_204  # 健康检查目标
   password: ""                                       # WebUI 访问密码，为空则不需要密码
 
 # ───────────────────────────────────────────────────────────────

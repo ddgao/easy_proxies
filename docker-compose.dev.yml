@@ -10,8 +10,10 @@ services:
     restart: unless-stopped
     # macOS 不支持 network_mode: host，必须使用端口映射
     ports:
+      - "1221:1221"       # GeoIP 路由入口
       - "2323:2323"       # Pool 入口
       - "2324:2324"       # Sticky 入口
+      - "2330:2330"       # Lease Gateway
       - "9091:9091"       # WebUI
       # multi-port 在 macOS Docker 中无法映射 8k 端口，仅映射前 100 个用于验证
       - "24000-24100:24000-24100"
