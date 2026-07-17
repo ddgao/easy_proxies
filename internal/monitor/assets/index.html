@@ -563,6 +563,16 @@
             <div class="stat-sub" style="color: var(--text-muted);">Lease Gateway</div>
           </div>
           <div class="stat-panel">
+            <div class="stat-title">Gateway 连接</div>
+            <div class="stat-value" style="color: var(--primary);" id="leaseGatewayConnections">0 / 0</div>
+            <div class="stat-sub" style="color: var(--text-muted);">活动数 / 全局上限</div>
+          </div>
+          <div class="stat-panel">
+            <div class="stat-title">容量拒绝</div>
+            <div class="stat-value" style="color: var(--warning);" id="leaseGatewayRejections">0</div>
+            <div class="stat-sub" style="color: var(--text-muted);">累计 503 请求</div>
+          </div>
+          <div class="stat-panel">
             <div class="stat-title">当前活动代</div>
             <div class="stat-value tt-mono" style="font-size: 18px;" id="activeGenerationID">-</div>
             <div class="stat-sub" style="color: var(--text-muted);">新租约分配目标</div>
@@ -1282,6 +1292,9 @@
           ? `revision ${refreshState.config_revision || 0} · 待排空后执行`
           : `revision ${refreshState.config_revision || 0} · waiters ${refreshState.shared_waiters || 0}${refreshState.backoff_attempt ? ` · backoff ${refreshState.backoff_attempt}` : ''}`;
         document.getElementById('activeLeaseCount').textContent = leases.length;
+        const gatewayMetrics = runtime.gateway_metrics || {};
+        document.getElementById('leaseGatewayConnections').textContent = `${gatewayMetrics.active_connections || 0} / ${gatewayMetrics.max_connections || 0}`;
+        document.getElementById('leaseGatewayRejections').textContent = gatewayMetrics.connection_rejections || 0;
         document.getElementById('leaseSummaryRows').innerHTML = leases.length ? leases.map(lease => `
           <tr>
             <td class="tt-mono">${escapeHtml(lease.token_fingerprint || '-')}</td>

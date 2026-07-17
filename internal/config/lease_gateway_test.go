@@ -53,6 +53,9 @@ func TestConfig_LeaseGatewayIsOptInAndRejectsUnsafeSettings(t *testing.T) {
 	if valid.LeaseGateway.Listen != "127.0.0.1" || valid.LeaseGateway.Port != 2330 {
 		t.Fatalf("gateway listen = %s:%d, want 127.0.0.1:2330", valid.LeaseGateway.Listen, valid.LeaseGateway.Port)
 	}
+	if valid.LeaseGateway.MaxConnections != 10000 {
+		t.Fatalf("gateway max connections = %d, want 10000", valid.LeaseGateway.MaxConnections)
+	}
 
 	conflict := newConfig()
 	conflict.LeaseGateway.Enabled = true

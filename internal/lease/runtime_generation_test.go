@@ -104,6 +104,66 @@ func TestRuntime_ExpiresOldLeaseAndRetiresDrainingGeneration(t *testing.T) {
 	}
 }
 
+// TestRuntime_GenerationDrainTimeoutAutomaticallyForceClosesResidualLeases 验证代际排空硬边界：
+// 到达 generation_drain_timeout 后无需管理员操作，也会关闭旧代际并记录受影响租约数。
+func TestRuntime_GenerationDrainTimeoutAutomaticallyForceClosesResidualLeases(t *testing.T) {
+	var timers []*manualTimer
+	oldClosed := 0
+	runtime, err := NewRuntime(Options{
+		APIToken: "machine-token", ProxyURL: "http://127.0.0.1:2330", GenerationID: "generation-1",
+		GenerationClose: func() error {
+			oldClosed++
+			return nil
+		},
+		AfterFunc: func(_ time.Duration, callback func()) Timer {
+			timer := &manualTimer{callback: callback}
+			timers = append(timers, timer)
+			return timer
+		},
+		Nodes: []Node{{Key: "old-node", Dialer: unavailableDialer{}}},
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	grant, err := runtime.Acquire(context.Background(), "residual")
+	if err != nil {
+		t.Fatalf("acquire old lease: %v", err)
+	}
+	connection, admission := runtime.connectionForToken(grant.LeaseToken)
+	if admission != connectionAdmissionAccepted {
+		t.Fatalf("connection admission = %v", admission)
+	}
+	connectionClosed := 0
+	if !connection.RegisterCloser(func() { connectionClosed++ }) {
+		t.Fatal("register generation connection closer")
+	}
+	validation := &ValidationRun{total: 1, minReady: 1}
+	if err := runtime.BeginCandidate("generation-2", 1, validation); err != nil {
+		t.Fatalf("begin candidate: %v", err)
+	}
+	newNode := Node{Key: "new-node", Dialer: unavailableDialer{}}
+	if err := runtime.Promote(Candidate{ID: "generation-2", Nodes: []Node{newNode}}, []Node{newNode}, validation); err != nil {
+		t.Fatalf("promote candidate: %v", err)
+	}
+	if len(timers) != 2 {
+		t.Fatalf("timer count = %d, want lease TTL and generation drain timers", len(timers))
+	}
+	timers[1].Fire()
+	snapshot := runtime.Snapshot()
+	if oldClosed != 1 || connectionClosed != 1 || len(snapshot.ActiveLeases) != 0 || len(snapshot.Generations) != 1 || snapshot.Generations[0].ID != "generation-2" {
+		t.Fatalf("snapshot after generation timeout = %+v, oldClosed=%d connectionClosed=%d", snapshot, oldClosed, connectionClosed)
+	}
+	if snapshot.GatewayMetrics.ActiveConnections != 0 || len(snapshot.InvariantAlerts) != 0 {
+		t.Fatalf("gateway state after generation timeout = %+v alerts=%v", snapshot.GatewayMetrics, snapshot.InvariantAlerts)
+	}
+	events := runtime.EventSnapshot(0, "GENERATION_DRAIN_TIMEOUT")
+	if len(events) != 1 || events[0].AffectedLeases != 1 || events[0].AffectedConnections != 1 {
+		t.Fatalf("generation timeout events = %+v", events)
+	}
+	connection.Release()
+}
+
 // TestRuntime_DoesNotAllocateSameNodeKeyAcrossGenerations 验证 Node Key 占用表跨代际共享，
 // 旧租约释放前，新 Active 即使包含同一节点也不能把它再次出租。
 func TestRuntime_DoesNotAllocateSameNodeKeyAcrossGenerations(t *testing.T) {

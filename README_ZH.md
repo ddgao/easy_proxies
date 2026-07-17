@@ -107,6 +107,7 @@ lease_gateway:
   enabled: true
   listen: 127.0.0.1
   port: 2330
+  max_connections: 10000
   min_ready_nodes: 50
   probe_expected_status: 204
   # probe_fallback_target: https://fallback.example/generate_204
@@ -137,6 +138,8 @@ curl -X DELETE http://127.0.0.1:9091/api/proxy-leases \
 Lease Token 只在申请响应中返回；`conflict_key` 原文也不会进入运行时快照、日志或 WebUI，监控面仅显示不可用于代理认证或反查业务标识的短指纹。租约流量不会在请求失败后自动切换节点。订阅刷新会并行验证 Candidate，达标后新租约进入新 Active；刷新前签发的租约仍固定在原代际和原 Node Key，直到释放或到期。
 
 每个租约冲突域维护独立的严格 FIFO 空闲节点队列；节点完成排空、验证或恢复后进入该域队尾。域内无空闲节点时申请最多等待 `acquire_wait_timeout`。释放或到期后立即拒绝新连接，已有连接最多排空 `drain_timeout`；排空期间仅在原冲突域内继续占用 Node Key。旧代际最多保留到 `generation_drain_timeout`，排空期间的新刷新只保存最新订阅快照，不创建第三个代际。
+
+Gateway 不限制单个租约的并发连接数，但所有租约合计最多建立 `max_connections` 个活动连接；达到上限时，有效 Lease Token 的新请求返回 `503`，已有连接不受影响。
 
 运维接口：
 

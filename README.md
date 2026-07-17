@@ -132,6 +132,7 @@ lease_gateway:
   enabled: true
   listen: 127.0.0.1
   port: 2330
+  max_connections: 10000
   min_ready_nodes: 50
   probe_expected_status: 204
   # probe_fallback_target: https://fallback.example/generate_204
@@ -145,6 +146,8 @@ Acquire a lease through `POST /api/proxy-leases` with `Authorization: Bearer <ap
 Lease Tokens and raw conflict keys never appear in monitoring responses or the WebUI; only short, non-credential fingerprints are exposed. Leased traffic does not automatically fail over to another node. Subscription refresh builds and validates a Candidate generation in parallel. New leases use it only after promotion; leases issued before promotion remain bound to their original generation and Node Key until release or expiry.
 
 Each conflict domain owns a strict FIFO idle-node queue. Nodes join its tail after validation, recovery, or lease draining; acquisition waits up to `acquire_wait_timeout` when that domain is exhausted. Release or expiry rejects new connections immediately and drains existing connections for at most `drain_timeout`, retaining Node Key ownership only inside the original conflict domain. A previous generation drains for at most `generation_drain_timeout`, and refreshes received while two generations are alive retain only the latest subscription snapshot.
+
+The Gateway does not impose a per-lease connection cap, but all leases share the process-wide `max_connections` limit. Once capacity is exhausted, new requests with otherwise valid Lease Tokens receive `503`; existing connections continue unaffected.
 
 Operational endpoints include `GET /health/live`, `GET /health/ready`, the unified and paginated `GET /api/proxy-runtime` snapshot, resumable `GET /api/proxy-events?after=<sequence>` SSE, and filtered `GET /api/proxy-audit`. High-impact `/api/proxy-admin/*` and `/api/proxy-nodes/*` actions require WebUI authentication, `confirm: true`, and a non-empty reason; accepted, rejected, and failed actions are audited without credentials.
 

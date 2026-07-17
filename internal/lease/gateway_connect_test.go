@@ -3,6 +3,7 @@ package lease_test
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +30,218 @@ func (failingNodeDialer) DialContext(context.Context, string, string) (net.Conn,
 
 func (d connectNodeDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, network, d.address)
+}
+
+// TestGateway_EnforcesProcessConnectionLimit 验证资源保护是进程级而非租约级：
+// 不同冲突域即使可以共享节点，也不能绕过 Gateway 的全局活动连接上限。
+func TestGateway_EnforcesProcessConnectionLimit(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	releaseFirstRequest := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(releaseFirstRequest)
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if targetCalls.Add(1) == 1 {
+			close(requestStarted)
+			<-releaseFirst
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(target.Close)
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse target URL: %v", err)
+	}
+	gatewayListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen gateway: %v", err)
+	}
+	runtime, err := lease.NewRuntime(lease.Options{
+		APIToken: "machine-token", ProxyURL: "http://" + gatewayListener.Addr().String(), MaxConnections: 1,
+		Nodes: []lease.Node{{Key: "shared-node", Dialer: connectNodeDialer{address: targetURL.Host}}},
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	gateway := &http.Server{Handler: runtime.GatewayHandler()}
+	go func() { _ = gateway.Serve(gatewayListener) }()
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = gateway.Shutdown(shutdownCtx)
+	})
+	first, err := runtime.AcquireLease(context.Background(), lease.AcquireRequest{ConflictKey: "account:100"})
+	if err != nil {
+		t.Fatalf("acquire first lease: %v", err)
+	}
+	second, err := runtime.AcquireLease(context.Background(), lease.AcquireRequest{ConflictKey: "account:200"})
+	if err != nil {
+		t.Fatalf("acquire second lease: %v", err)
+	}
+	clientFor := func(rawProxyURL string) *http.Client {
+		proxyURL, parseErr := url.Parse(rawProxyURL)
+		if parseErr != nil {
+			t.Fatalf("parse proxy URL: %v", parseErr)
+		}
+		return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		response, requestErr := clientFor(first.ProxyURL).Get("http://business.example/first")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		firstDone <- requestErr
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not reach target")
+	}
+	secondClient := clientFor(second.ProxyURL)
+	limitedResponse, err := secondClient.Get("http://business.example/limited")
+	if err != nil {
+		t.Fatalf("request at global limit: %v", err)
+	}
+	_ = limitedResponse.Body.Close()
+	if limitedResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status at global limit = %d, want 503", limitedResponse.StatusCode)
+	}
+	metrics := runtime.Snapshot().GatewayMetrics
+	if metrics.ActiveConnections != 1 || metrics.MaxConnections != 1 || metrics.ConnectionRejections != 1 {
+		t.Fatalf("gateway metrics at limit = %+v", metrics)
+	}
+	releaseFirstRequest()
+	select {
+	case requestErr := <-firstDone:
+		if requestErr != nil {
+			t.Fatalf("first request failed: %v", requestErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request did not finish")
+	}
+	retryResponse, err := secondClient.Get("http://business.example/retry")
+	if err != nil {
+		t.Fatalf("request after capacity release: %v", err)
+	}
+	_ = retryResponse.Body.Close()
+	if retryResponse.StatusCode != http.StatusOK {
+		t.Fatalf("status after capacity release = %d", retryResponse.StatusCode)
+	}
+}
+
+// TestGateway_DoesNotApplyPerLeaseConnectionLimit 验证单个租约可以使用多个全局连接槽位。
+func TestGateway_DoesNotApplyPerLeaseConnectionLimit(t *testing.T) {
+	twoRequestsStarted := make(chan struct{})
+	releaseRequests := make(chan struct{})
+	var releaseRequestsOnce sync.Once
+	releaseBlockedRequests := func() { releaseRequestsOnce.Do(func() { close(releaseRequests) }) }
+	t.Cleanup(releaseBlockedRequests)
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if targetCalls.Add(1) == 2 {
+			close(twoRequestsStarted)
+		}
+		<-releaseRequests
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(target.Close)
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse target URL: %v", err)
+	}
+	gatewayListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen gateway: %v", err)
+	}
+	runtime, err := lease.NewRuntime(lease.Options{
+		APIToken: "machine-token", ProxyURL: "http://" + gatewayListener.Addr().String(), MaxConnections: 2,
+		Nodes: []lease.Node{{Key: "node-a", Dialer: connectNodeDialer{address: targetURL.Host}}},
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	gateway := &http.Server{Handler: runtime.GatewayHandler()}
+	go func() { _ = gateway.Serve(gatewayListener) }()
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = gateway.Shutdown(shutdownCtx)
+	})
+	grant, err := runtime.Acquire(context.Background(), "parallel")
+	if err != nil {
+		t.Fatalf("acquire lease: %v", err)
+	}
+	proxyURL, err := url.Parse(grant.ProxyURL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	results := make(chan error, 2)
+	for index := 0; index < 2; index++ {
+		go func() {
+			response, requestErr := client.Get("http://business.example/parallel")
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			results <- requestErr
+		}()
+	}
+	select {
+	case <-twoRequestsStarted:
+	case <-time.After(time.Second):
+		t.Fatal("one lease did not establish two concurrent requests")
+	}
+	snapshot := runtime.Snapshot()
+	if len(snapshot.ActiveLeases) != 1 || snapshot.ActiveLeases[0].ActiveConnections != 2 || snapshot.GatewayMetrics.ConnectionRejections != 0 {
+		t.Fatalf("parallel lease snapshot = %+v metrics=%+v", snapshot.ActiveLeases, snapshot.GatewayMetrics)
+	}
+	releaseBlockedRequests()
+	for index := 0; index < 2; index++ {
+		if requestErr := <-results; requestErr != nil {
+			t.Fatalf("parallel request failed: %v", requestErr)
+		}
+	}
+}
+
+// TestGateway_ProcessRestartInvalidatesLeaseToken 验证租约仅存在于进程内存中。
+func TestGateway_ProcessRestartInvalidatesLeaseToken(t *testing.T) {
+	options := lease.Options{
+		APIToken: "machine-token", ProxyURL: "http://127.0.0.1:2330",
+		Nodes: []lease.Node{{Key: "node-a", Dialer: unavailableGatewayDialer{}}},
+	}
+	firstRuntime, err := lease.NewRuntime(options)
+	if err != nil {
+		t.Fatalf("new first runtime: %v", err)
+	}
+	grant, err := firstRuntime.Acquire(context.Background(), "before-restart")
+	if err != nil {
+		t.Fatalf("acquire before restart: %v", err)
+	}
+	if err := firstRuntime.Close(); err != nil {
+		t.Fatalf("close first runtime: %v", err)
+	}
+	secondRuntime, err := lease.NewRuntime(options)
+	if err != nil {
+		t.Fatalf("new second runtime: %v", err)
+	}
+	t.Cleanup(func() { _ = secondRuntime.Close() })
+	request := httptest.NewRequest(http.MethodGet, "http://business.example/after-restart", nil)
+	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("lease:"+grant.LeaseToken)))
+	response := httptest.NewRecorder()
+	secondRuntime.GatewayHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusProxyAuthRequired {
+		t.Fatalf("old token status after restart = %d, want 407", response.Code)
+	}
+}
+
+type unavailableGatewayDialer struct{}
+
+func (unavailableGatewayDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("not used")
 }
 
 // TestGateway_HTTPSConnectUsesLeasedNode 验证 HTTPS CONNECT 隧道只使用租约绑定的节点拨号器。

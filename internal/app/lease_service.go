@@ -99,6 +99,7 @@ func startLeaseServiceWithCandidate(ctx context.Context, cfg *config.Config, man
 		APIToken:               cfg.LeaseGateway.APIToken,
 		ProxyURL:               proxyURL,
 		TokenBytes:             32,
+		MaxConnections:         cfg.LeaseGateway.MaxConnections,
 		GenerationID:           managedCandidate.ID,
 		GenerationClose:        managedCandidate.Close,
 		NodeRecheck:            leaseNodeRechecker(cfg),
@@ -114,8 +115,13 @@ func startLeaseServiceWithCandidate(ctx context.Context, cfg *config.Config, man
 	}
 
 	service := &leaseService{
-		runtime:            runtime,
-		server:             &http.Server{Handler: runtime.GatewayHandler()},
+		runtime: runtime,
+		server: &http.Server{
+			Handler:           runtime.GatewayHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    32 << 10,
+		},
 		serveDone:          make(chan error, 1),
 		ctx:                serviceCtx,
 		cancel:             serviceCancel,

@@ -84,6 +84,7 @@ lease_gateway:
   enabled: false
   listen: 127.0.0.1
   port: 2330
+  max_connections: 10000  # Gateway 进程级活动连接上限，不限制单个租约
   min_ready_nodes: 50
   probe_expected_status: 204
   acquire_wait_timeout: 10s

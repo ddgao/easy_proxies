@@ -100,6 +100,7 @@ type Options struct {
 	Nodes                  []Node
 	GenerationID           string
 	GenerationClose        func() error
+	MaxConnections         int
 }
 
 // Candidate 是已经构建但尚未提升的候选运行代际。
@@ -194,9 +195,11 @@ type NodeSummary struct {
 type GatewayMetrics struct {
 	AuthenticationFailures uint64 `json:"authentication_failures"`
 	InvalidTokens          uint64 `json:"invalid_tokens"`
+	ConnectionRejections   uint64 `json:"connection_rejections"`
 	ProxyFailures          uint64 `json:"proxy_failures"`
 	NodeRechecks           uint64 `json:"node_rechecks"`
 	ActiveConnections      int    `json:"active_connections"`
+	MaxConnections         int    `json:"max_connections"`
 }
 
 // RefreshSummary 是统一运行时快照中的订阅刷新协调状态。
@@ -303,7 +306,7 @@ type conflictDomainState struct {
 	initialLimit    int
 	initialCursor   int
 	initialExcluded map[string]struct{}
-	releasedQueue   []string
+	idleQueueTail   []string
 	queued          map[string]struct{}
 	occupied        map[string]struct{}
 	waiterCount     int
@@ -316,6 +319,14 @@ type connectionUse struct {
 	dialer  NodeDialer
 	once    sync.Once
 }
+
+type connectionAdmission uint8
+
+const (
+	connectionAdmissionAccepted connectionAdmission = iota
+	connectionAdmissionInvalidToken
+	connectionAdmissionAtCapacity
+)
 
 func (u *connectionUse) RegisterCloser(closer func()) bool {
 	return u.runtime.registerConnectionCloser(u.hash, u.id, closer)
@@ -352,6 +363,8 @@ type Runtime struct {
 	apiToken               string
 	proxyURL               *url.URL
 	tokenBytes             int
+	maxConnections         int
+	activeConnections      int
 	ttl                    time.Duration
 	acquireWaitTimeout     time.Duration
 	drainTimeout           time.Duration
@@ -838,6 +851,9 @@ func NewRuntime(opts Options) (*Runtime, error) {
 	if opts.TokenBytes < 32 {
 		return nil, errors.New("lease token must contain at least 32 random bytes")
 	}
+	if opts.MaxConnections <= 0 {
+		opts.MaxConnections = 10000
+	}
 	if opts.TTL <= 0 {
 		opts.TTL = 2 * time.Minute
 	}
@@ -882,6 +898,7 @@ func NewRuntime(opts Options) (*Runtime, error) {
 		apiToken:               opts.APIToken,
 		proxyURL:               proxyURL,
 		tokenBytes:             opts.TokenBytes,
+		maxConnections:         opts.MaxConnections,
 		ttl:                    opts.TTL,
 		acquireWaitTimeout:     opts.AcquireWaitTimeout,
 		drainTimeout:           opts.DrainTimeout,
@@ -1070,7 +1087,7 @@ func (r *Runtime) resetConflictDomainQueueLocked(domain *conflictDomainState) {
 	domain.initialLimit = len(r.nodes)
 	domain.initialCursor = 0
 	domain.initialExcluded = make(map[string]struct{}, len(domain.occupied)+len(r.unavailable)+len(r.blocked))
-	domain.releasedQueue = nil
+	domain.idleQueueTail = nil
 	domain.queued = make(map[string]struct{})
 	for nodeKey := range domain.occupied {
 		domain.initialExcluded[nodeKey] = struct{}{}
@@ -1107,9 +1124,9 @@ func (r *Runtime) nextNodeForDomainLocked(domain *conflictDomainState) Node {
 		}
 		return node
 	}
-	for len(domain.releasedQueue) > 0 {
-		nodeKey := domain.releasedQueue[0]
-		domain.releasedQueue = domain.releasedQueue[1:]
+	for len(domain.idleQueueTail) > 0 {
+		nodeKey := domain.idleQueueTail[0]
+		domain.idleQueueTail = domain.idleQueueTail[1:]
 		delete(domain.queued, nodeKey)
 		node, exists := r.activeNodeLocked(nodeKey)
 		if !exists || r.nodeUnavailableLocked(nodeKey) {
@@ -1192,7 +1209,7 @@ func (r *Runtime) enqueueDomainNodeLocked(domain *conflictDomainState, nodeKey s
 	if _, queued := domain.queued[nodeKey]; queued {
 		return
 	}
-	domain.releasedQueue = append(domain.releasedQueue, nodeKey)
+	domain.idleQueueTail = append(domain.idleQueueTail, nodeKey)
 	domain.queued[nodeKey] = struct{}{}
 }
 
@@ -1208,13 +1225,13 @@ func (r *Runtime) excludeNodeFromAllDomainsLocked(nodeKey string) {
 		if _, queued := domain.queued[nodeKey]; !queued {
 			continue
 		}
-		filtered := domain.releasedQueue[:0]
-		for _, queuedNodeKey := range domain.releasedQueue {
+		filtered := domain.idleQueueTail[:0]
+		for _, queuedNodeKey := range domain.idleQueueTail {
 			if queuedNodeKey != nodeKey {
 				filtered = append(filtered, queuedNodeKey)
 			}
 		}
-		domain.releasedQueue = filtered
+		domain.idleQueueTail = filtered
 		delete(domain.queued, nodeKey)
 	}
 }
@@ -1426,7 +1443,6 @@ func (r *Runtime) Snapshot() Snapshot {
 	}
 	sort.Strings(snapshot.BlockedNodeKeys)
 	for _, record := range r.leases {
-		snapshot.GatewayMetrics.ActiveConnections += record.activeConnections
 		snapshot.ActiveLeases = append(snapshot.ActiveLeases, LeaseSummary{
 			TokenFingerprint:    base64.RawURLEncoding.EncodeToString(record.hash[:6]),
 			ConflictFingerprint: conflictFingerprint(record.conflictDomain),
@@ -1440,6 +1456,9 @@ func (r *Runtime) Snapshot() Snapshot {
 	}
 	snapshot.GatewayMetrics.AuthenticationFailures = r.gatewayMetrics.AuthenticationFailures
 	snapshot.GatewayMetrics.InvalidTokens = r.gatewayMetrics.InvalidTokens
+	snapshot.GatewayMetrics.ConnectionRejections = r.gatewayMetrics.ConnectionRejections
+	snapshot.GatewayMetrics.ActiveConnections = r.activeConnections
+	snapshot.GatewayMetrics.MaxConnections = r.maxConnections
 	snapshot.GatewayMetrics.ProxyFailures = r.gatewayMetrics.ProxyFailures
 	snapshot.GatewayMetrics.NodeRechecks = r.gatewayMetrics.NodeRechecks
 	sort.Slice(snapshot.ActiveLeases, func(i, j int) bool {
@@ -1550,6 +1569,7 @@ func (r *Runtime) invariantAlertsLocked() []string {
 	}
 	leaseOwned := make(map[conflictDomainKey]map[string]struct{})
 	leaseCounts := make(map[string]int)
+	activeConnections := 0
 	for _, record := range r.leases {
 		if _, exists := r.generations[record.generationID]; !exists {
 			alerts = append(alerts, "orphan lease: "+record.generationID)
@@ -1564,6 +1584,7 @@ func (r *Runtime) invariantAlertsLocked() []string {
 		}
 		domainOwned[record.node.Key] = struct{}{}
 		leaseCounts[record.node.Key]++
+		activeConnections += record.activeConnections
 	}
 	for nodeKey, count := range r.nodeLeaseCounts {
 		if leaseCounts[nodeKey] != count {
@@ -1573,6 +1594,9 @@ func (r *Runtime) invariantAlertsLocked() []string {
 	}
 	for nodeKey, count := range leaseCounts {
 		alerts = append(alerts, fmt.Sprintf("missing Node Key lease count: %s leases=%d", nodeKey, count))
+	}
+	if activeConnections != r.activeConnections {
+		alerts = append(alerts, fmt.Sprintf("active connection count mismatch: runtime=%d leases=%d", r.activeConnections, activeConnections))
 	}
 	for domainKey, domain := range r.conflictDomains {
 		for nodeKey := range domain.occupied {
@@ -1613,6 +1637,7 @@ func (r *Runtime) Close() error {
 	clear(r.leases)
 	clear(r.conflictDomains)
 	clear(r.nodeLeaseCounts)
+	r.activeConnections = 0
 	closers := make([]func() error, 0, len(r.generations))
 	for _, generation := range r.generations {
 		if generation.drainTimer != nil {
@@ -1631,17 +1656,17 @@ func (r *Runtime) Close() error {
 	return errors.Join(closeErrors...)
 }
 
-func (r *Runtime) connectionForToken(token string) (*connectionUse, bool) {
+func (r *Runtime) connectionForToken(token string) (*connectionUse, connectionAdmission) {
 	hash := sha256.Sum256([]byte(token))
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return nil, false
+		return nil, connectionAdmissionInvalidToken
 	}
 	record, exists := r.leases[hash]
 	if !exists || record.state != LeaseStateActive {
 		r.mu.Unlock()
-		return nil, false
+		return nil, connectionAdmissionInvalidToken
 	}
 	if !r.now().Before(record.expiresAt) {
 		closeGeneration := r.beginDrainLeaseLocked(hash, LeaseStateDraining)
@@ -1649,15 +1674,21 @@ func (r *Runtime) connectionForToken(token string) (*connectionUse, bool) {
 		if closeGeneration != nil {
 			go func() { _ = closeGeneration() }()
 		}
-		return nil, false
+		return nil, connectionAdmissionInvalidToken
+	}
+	if r.activeConnections >= r.maxConnections {
+		r.gatewayMetrics.ConnectionRejections++
+		r.mu.Unlock()
+		return nil, connectionAdmissionAtCapacity
 	}
 	r.nextConnectionID++
 	connectionID := r.nextConnectionID
 	record.activeConnections++
+	r.activeConnections++
 	record.connections[connectionID] = nil
 	use := &connectionUse{runtime: r, hash: hash, id: connectionID, dialer: record.node.Dialer}
 	r.mu.Unlock()
-	return use, true
+	return use, connectionAdmissionAccepted
 }
 
 func (r *Runtime) reportNodeFailure(hash [sha256.Size]byte) {
@@ -1774,6 +1805,9 @@ func (r *Runtime) releaseConnection(hash [sha256.Size]byte, connectionID uint64)
 	delete(record.connections, connectionID)
 	if record.activeConnections > 0 {
 		record.activeConnections--
+		if r.activeConnections > 0 {
+			r.activeConnections--
+		}
 	}
 	var closeGeneration func() error
 	if record.state != LeaseStateActive && record.activeConnections == 0 {
@@ -1849,6 +1883,12 @@ func (r *Runtime) finalizeLeaseLocked(hash [sha256.Size]byte, record *leaseRecor
 	}
 	if record.drainTimer != nil {
 		record.drainTimer.Stop()
+	}
+	if record.activeConnections > 0 {
+		r.activeConnections -= record.activeConnections
+		if r.activeConnections < 0 {
+			r.activeConnections = 0
+		}
 	}
 	if record.state == LeaseStateBroken {
 		r.recentLeases = append(r.recentLeases, LeaseSummary{
@@ -1927,8 +1967,12 @@ func (r *Runtime) forceCloseGenerationWithEvent(generationID, eventType string) 
 		}
 		affectedLeases++
 		affectedConnections += record.activeConnections
+		r.activeConnections -= record.activeConnections
 		if record.expiryTimer != nil {
 			record.expiryTimer.Stop()
+		}
+		if r.activeConnections < 0 {
+			r.activeConnections = 0
 		}
 		if record.drainTimer != nil {
 			record.drainTimer.Stop()

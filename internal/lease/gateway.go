@@ -25,11 +25,15 @@ func (h *gatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
-	connection, ok := h.runtime.connectionForToken(token)
-	if !ok {
+	connection, admission := h.runtime.connectionForToken(token)
+	if admission == connectionAdmissionInvalidToken {
 		h.runtime.recordAuthenticationFailure(true)
 		w.Header().Set("Proxy-Authenticate", `Basic realm="lease-gateway"`)
 		http.Error(w, "invalid lease token", http.StatusProxyAuthRequired)
+		return
+	}
+	if admission == connectionAdmissionAtCapacity {
+		http.Error(w, "lease gateway connection capacity exhausted", http.StatusServiceUnavailable)
 		return
 	}
 	defer connection.Release()

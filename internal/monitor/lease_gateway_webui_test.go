@@ -30,6 +30,11 @@ func TestWebUI_ShowsLeaseGatewaySummary(t *testing.T) {
 	for _, expected := range []string{
 		"leaseGatewayStatus",
 		"activeLeaseCount",
+		"leaseGatewayConnections",
+		"leaseGatewayRejections",
+		"gateway_metrics",
+		"max_connections",
+		"connection_rejections",
 		"activeGenerationID",
 		"leaseValidationStatus",
 		"leaseGenerationRows",

@@ -88,6 +88,7 @@ type LeaseGatewayConfig struct {
 	Listen                 string        `yaml:"listen"`
 	Port                   uint16        `yaml:"port"`
 	APIToken               string        `yaml:"api_token"`
+	MaxConnections         int           `yaml:"max_connections"`
 	MinReadyNodes          int           `yaml:"min_ready_nodes"`
 	ProbeFallbackTarget    string        `yaml:"probe_fallback_target"`
 	ProbeExpectedStatus    int           `yaml:"probe_expected_status"`
@@ -847,6 +848,9 @@ func (c *Config) normalizeLeaseGateway() error {
 	}
 	if c.LeaseGateway.MinReadyNodes <= 0 {
 		c.LeaseGateway.MinReadyNodes = 50
+	}
+	if c.LeaseGateway.MaxConnections <= 0 {
+		c.LeaseGateway.MaxConnections = 10000
 	}
 	if c.LeaseGateway.ProbeExpectedStatus == 0 {
 		c.LeaseGateway.ProbeExpectedStatus = http.StatusNoContent

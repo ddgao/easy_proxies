@@ -115,6 +115,70 @@ func TestLeaseGenerationPromotion_KeepsOldLeaseAndRoutesNewLeaseToCandidate(t *t
 	}
 }
 
+// TestLeaseGenerationPromotion_RevalidatesNodeThatReappearsAfterRemoval 验证退休节点重新出现的准入边界：
+// 相同 Node Key 在后续代际重新出现时必须再次访问探测目标，不能复用旧代际健康状态。
+func TestLeaseGenerationPromotion_RevalidatesNodeThatReappearsAfterRemoval(t *testing.T) {
+	var returningProbeCount atomic.Int32
+	returningServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health/ready" {
+			returningProbeCount.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = io.WriteString(w, "returning")
+	}))
+	t.Cleanup(returningServer.Close)
+	returningURL, err := url.Parse(returningServer.URL)
+	if err != nil {
+		t.Fatalf("parse returning upstream: %v", err)
+	}
+	otherServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health/ready" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = io.WriteString(w, "other")
+	}))
+	t.Cleanup(otherServer.Close)
+	otherURL, err := url.Parse(otherServer.URL)
+	if err != nil {
+		t.Fatalf("parse other upstream: %v", err)
+	}
+	cfg := generationTestConfig(t)
+	management := generationManagementServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	service, err := startLeaseService(ctx, cfg, management, []lease.Node{{
+		Key: "returning-node", Dialer: configuredNodeDialer{address: returningURL.Host},
+	}})
+	if err != nil {
+		t.Fatalf("start lease service: %v", err)
+	}
+	waitLeaseReady(t, service)
+	t.Cleanup(func() { _ = service.Close(context.Background()) })
+	initialProbeCount := returningProbeCount.Load()
+	if initialProbeCount == 0 {
+		t.Fatal("returning node was not validated in initial generation")
+	}
+	if err := service.Promote(ctx, lease.Candidate{
+		ID: "generation-2", Nodes: []lease.Node{{Key: "other-node", Dialer: configuredNodeDialer{address: otherURL.Host}}},
+	}); err != nil {
+		t.Fatalf("promote generation without returning node: %v", err)
+	}
+	if err := service.Promote(ctx, lease.Candidate{
+		ID: "generation-3", Nodes: []lease.Node{{Key: "returning-node", Dialer: configuredNodeDialer{address: returningURL.Host}}},
+	}); err != nil {
+		t.Fatalf("promote generation with returning node: %v", err)
+	}
+	if got := returningProbeCount.Load(); got <= initialProbeCount {
+		t.Fatalf("returning node probe count = %d, want more than initial %d", got, initialProbeCount)
+	}
+	snapshot := service.runtime.Snapshot()
+	if len(snapshot.Generations) != 1 || snapshot.Generations[0].ID != "generation-3" || snapshot.Generations[0].Role != lease.GenerationRoleActive {
+		t.Fatalf("generation after returning node promotion = %+v", snapshot.Generations)
+	}
+}
+
 // TestLeaseGenerationPromotion_ExposesCandidateWhileValidationIsRunning 验证候选代在探测期间可观测，
 // 管理员能够区分正在服务的 Active 与尚未准入的 Candidate。
 func TestLeaseGenerationPromotion_ExposesCandidateWhileValidationIsRunning(t *testing.T) {
