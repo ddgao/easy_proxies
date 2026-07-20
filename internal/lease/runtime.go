@@ -1192,8 +1192,12 @@ func (r *Runtime) nodeUnavailableLocked(nodeKey string) bool {
 	if _, unavailable := r.unavailable[nodeKey]; unavailable {
 		return true
 	}
-	_, blocked := r.blocked[nodeKey]
-	return blocked
+	if _, blocked := r.blocked[nodeKey]; blocked {
+		return true
+	}
+	// 复检期间的节点不应被分配，避免将问题节点给到新租约
+	_, rechecking := r.rechecking[nodeKey]
+	return rechecking
 }
 
 func (r *Runtime) enqueueDomainNodeLocked(domain *conflictDomainState, nodeKey string) {
